@@ -16,6 +16,8 @@ import argparse
 from datetime import datetime, timezone
 
 import cv2
+import threading
+import queue as _queue
 
 import log_setup
 import db
@@ -218,13 +220,41 @@ def _run_test(source=None) -> None:
     if is_file:
         duration = int(total_frames / fps_src) if fps_src else 0
         log.info(f"  Video : {total_frames} frames  {fps_src:.0f}fps  ~{duration}s")
-    log.info(f"✅ Source opened — press Q in the preview window to quit")
+    log.info("✅ Source opened — press Q in the preview window to quit")
     log.info("─" * 52)
 
-    seen_plates    = {}   # plate → count
-    frame_n        = 0
-    t_start        = time.time()
-    last_dets      = []   # keep last detections visible between runs
+    # ── Detection runs in a background thread so it never blocks the display ──
+    # frame_q : main thread drops the latest frame here (size=1, always fresh)
+    # result_q: detection thread posts results here (size=1, main reads latest)
+    frame_q  = _queue.Queue(maxsize=1)
+    result_q = _queue.Queue(maxsize=1)
+    det_stop  = threading.Event()
+
+    def _detect_worker():
+        while not det_stop.is_set():
+            try:
+                frm = frame_q.get(timeout=0.3)
+            except _queue.Empty:
+                continue
+            dets = detector.detect(frm)
+            # replace any unconsumed result with the latest
+            try:
+                result_q.put_nowait(dets)
+            except _queue.Full:
+                try:
+                    result_q.get_nowait()
+                except _queue.Empty:
+                    pass
+                result_q.put_nowait(dets)
+
+    det_thread = threading.Thread(target=_detect_worker, daemon=True, name="detector")
+    det_thread.start()
+
+    seen_plates = {}
+    frame_n     = 0
+    t_start     = time.time()
+    last_dets   = []
+    no_det_ctr  = 0   # frames since last detection — used to clear overlay
 
     while not _shutdown:
         ret, frame = cap.read()
@@ -233,52 +263,60 @@ def _run_test(source=None) -> None:
                 log.info("End of video.")
             else:
                 log.warning("Camera read failed — retrying…")
-                time.sleep(0.1)
+                time.sleep(0.05)
             break
 
         frame_n += 1
 
-        # Run detection every 3rd frame — same cadence as live camera
-        if frame_n % 3 == 0:
-            dets = detector.detect(frame)
+        # Feed a fresh frame to the detector (drop if it's still busy)
+        try:
+            frame_q.put_nowait(frame.copy())
+        except _queue.Full:
+            pass
+
+        # Pick up the latest detection result (non-blocking)
+        try:
+            dets = result_q.get_nowait()
             if dets:
-                last_dets = dets   # update overlay only when something is found
-            elif last_dets:
-                # clear overlay after 15 frames of no detections
-                last_dets = []
+                no_det_ctr = 0
+                last_dets  = dets
+                for det in dets:
+                    plate = det["plate"]
+                    vtype = det["type"]
+                    detector.mark_seen(plate)
+                    seen_plates[plate] = seen_plates.get(plate, 0) + 1
+                    log.info(
+                        f"🚗  {plate:<12}  type={vtype:<10}  "
+                        f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
+                        f"(seen {seen_plates[plate]}x)"
+                    )
+            else:
+                no_det_ctr += 1
+                if no_det_ctr > 10:
+                    last_dets = []
+        except _queue.Empty:
+            pass
 
-            for det in dets:
-                plate = det["plate"]
-                vtype = det["type"]
-                detector.mark_seen(plate)
-                seen_plates[plate] = seen_plates.get(plate, 0) + 1
-                log.info(
-                    f"🚗  {plate:<12}  type={vtype:<10}  "
-                    f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
-                    f"(seen {seen_plates[plate]}x)"
-                )
-
-        # Draw the last known overlay on every frame for smooth display
+        # Draw overlay on every frame — always smooth regardless of detection speed
         vis = detector.draw(frame, last_dets)
 
-        # HUD: progress + unique plates count
         elapsed = int(time.time() - t_start)
-        if is_file:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
-            pct  = int(frame_n / total_frames * 100)
-            hud  = f"  {pct}%  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
+        if is_file and total_frames:
+            pct = int(frame_n / total_frames * 100)
+            hud = f"  {pct}%  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
         else:
-            hud  = f"  {elapsed}s  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
+            hud = f"  {elapsed}s  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
 
         (hw, hh), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
         cv2.rectangle(vis, (0, 0), (hw + 8, hh + 10), (30, 30, 30), -1)
         cv2.putText(vis, hud, (4, hh + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
         cv2.imshow("Laventra — Test Mode", vis)
-        key = cv2.waitKey(delay_ms) & 0xFF
-        if key in (ord('q'), ord('Q'), 27):
+        if cv2.waitKey(delay_ms) & 0xFF in (ord('q'), ord('Q'), 27):
             break
 
+    det_stop.set()
+    det_thread.join(timeout=3)
     cap.release()
     cv2.destroyAllWindows()
 
