@@ -133,20 +133,16 @@ class PlateDetector:
 
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-            # ── Build multiple preprocessing variants ────────────────────────
-            # 1. CLAHE + Otsu  — handles low contrast and uneven lighting
-            clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-            eq     = clahe.apply(gray)
-            _, bw  = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # ── Two preprocessing variants ───────────────────────────────────
+            # 1. CLAHE + Otsu  — handles uneven lighting and low contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+            eq    = clahe.apply(gray)
+            _, bw = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-            # 2. Inverted binary — works for dark-background plates
-            bw_inv = cv2.bitwise_not(bw)
-
-            # 3. Raw grayscale  — sometimes OCR reads better without binarization
+            # 2. Raw grayscale — works better when binarization destroys detail
             variants = [
-                cv2.cvtColor(bw,     cv2.COLOR_GRAY2RGB),
-                cv2.cvtColor(bw_inv, cv2.COLOR_GRAY2RGB),
-                cv2.cvtColor(gray,   cv2.COLOR_GRAY2RGB),
+                cv2.cvtColor(bw,   cv2.COLOR_GRAY2RGB),
+                cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB),
             ]
 
             best_text, best_conf = None, 0.0

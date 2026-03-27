@@ -212,9 +212,10 @@ def _run_test(source=None) -> None:
     log.info(f"✅ Source opened — press Q in the preview window to quit")
     log.info("─" * 52)
 
-    seen_plates   = {}   # plate → count
-    frame_n       = 0
-    t_start       = time.time()
+    seen_plates    = {}   # plate → count
+    frame_n        = 0
+    t_start        = time.time()
+    last_dets      = []   # keep last detections visible between runs
 
     while not _shutdown:
         ret, frame = cap.read()
@@ -227,32 +228,39 @@ def _run_test(source=None) -> None:
             break
 
         frame_n += 1
-        # Process every 3rd frame for camera; every frame for video
-        if not is_file and frame_n % 3 != 0:
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), ord('Q'), 27):
-                break
-            continue
 
-        detections = detector.detect(frame)
+        # Run detection every 3rd frame — same cadence as live camera
+        if frame_n % 3 == 0:
+            dets = detector.detect(frame)
+            if dets:
+                last_dets = dets   # update overlay only when something is found
+            elif last_dets:
+                # clear overlay after 15 frames of no detections
+                last_dets = []
 
-        for det in detections:
-            plate = det["plate"]
-            vtype = det["type"]
-            detector.mark_seen(plate)
-            seen_plates[plate] = seen_plates.get(plate, 0) + 1
-            log.info(
-                f"🚗  {plate:<12}  type={vtype:<10}  "
-                f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
-                f"(seen {seen_plates[plate]}x)"
-            )
+            for det in dets:
+                plate = det["plate"]
+                vtype = det["type"]
+                detector.mark_seen(plate)
+                seen_plates[plate] = seen_plates.get(plate, 0) + 1
+                log.info(
+                    f"🚗  {plate:<12}  type={vtype:<10}  "
+                    f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
+                    f"(seen {seen_plates[plate]}x)"
+                )
 
-        # Draw overlay
-        vis = detector.draw(frame, detections)
+        # Draw the last known overlay on every frame for smooth display
+        vis = detector.draw(frame, last_dets)
 
-        # HUD: elapsed time + unique plates count
+        # HUD: progress + unique plates count
         elapsed = int(time.time() - t_start)
-        hud     = f"  {elapsed}s  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
+        if is_file:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            pct  = int(frame_n / total_frames * 100)
+            hud  = f"  {pct}%  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
+        else:
+            hud  = f"  {elapsed}s  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
+
         (hw, hh), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
         cv2.rectangle(vis, (0, 0), (hw + 8, hh + 10), (30, 30, 30), -1)
         cv2.putText(vis, hud, (4, hh + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
