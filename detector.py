@@ -135,6 +135,27 @@ class PlateDetector:
             log.debug(f"OCR error: {e}")
             return None, 0.0
 
+    def draw(self, frame: np.ndarray, detections: list) -> np.ndarray:
+        """Draw bounding boxes and plate labels onto a copy of frame."""
+        out = frame.copy()
+        for det in detections:
+            x1, y1, x2, y2 = det["box"]
+            plate    = det["plate"]
+            vtype    = det["type"]
+            ocr_conf = det["ocr_conf"]
+
+            # Vehicle box
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 200, 0), 2)
+
+            # Label background + text
+            label    = f"{plate}  {vtype}  {ocr_conf:.0%}"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            lx, ly   = x1, max(y1 - 10, th + 4)
+            cv2.rectangle(out, (lx, ly - th - 4), (lx + tw + 6, ly + 2), (0, 200, 0), -1)
+            cv2.putText(out, label, (lx + 3, ly - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        return out
+
     @staticmethod
     def _clean(text: str):
         cleaned = re.sub(r"[^A-Z0-9]", "", text.upper())

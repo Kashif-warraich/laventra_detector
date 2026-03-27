@@ -1,9 +1,12 @@
 """
-python main.py          → run (setup on first launch)
-python main.py --setup  → re-run setup
-python main.py --status → show config and exit
-python main.py --reset  → clear session and start fresh
-python main.py --debug  → verbose logging
+python main.py                         → run (setup on first launch)
+python main.py --setup                 → re-run setup
+python main.py --status                → show config and exit
+python main.py --reset                 → clear session and start fresh
+python main.py --debug                 → verbose logging
+python main.py --test                  → test with configured camera (no API)
+python main.py --test --source FILE    → test with a video file (no API)
+python main.py --test --source 0       → test with laptop webcam (no API)
 """
 
 import sys
@@ -11,6 +14,8 @@ import time
 import signal
 import argparse
 from datetime import datetime, timezone
+
+import cv2
 
 import log_setup
 import db
@@ -27,6 +32,10 @@ def _args():
     p.add_argument("--status", action="store_true")
     p.add_argument("--reset",  action="store_true")
     p.add_argument("--debug",  action="store_true")
+    p.add_argument("--test",   action="store_true",
+                   help="Test mode: live preview window, no API posting")
+    p.add_argument("--source", default=None,
+                   help="Video file or camera index for --test (default: configured camera)")
     return p.parse_args()
 
 
@@ -153,6 +162,118 @@ def _interactive_reconnect() -> bool:
         # choice == "3" or anything else
         log.info("Continuing in offline mode — events will be queued")
         return False
+
+
+def _run_test(source=None) -> None:
+    import os
+
+    # Resolve source: explicit arg > configured camera > webcam 0
+    if source is None:
+        source = db.session_get("camera_url", "0")
+    src = int(source) if str(source).strip().isdigit() else source
+    is_file = isinstance(src, str) and os.path.isfile(src)
+
+    print()
+    print("═" * 52)
+    print("  LAVENTRA DETECTOR — Test Mode")
+    print("═" * 52)
+    print(f"  Source  : {source}")
+    print(f"  Type    : {'video file' if is_file else 'camera feed'}")
+    print(f"  API     : disabled (test only)")
+    print("═" * 52)
+    print()
+    print("  Press Q or Ctrl+C to quit")
+    print()
+
+    log.info("Loading AI models…")
+    detector = det_module.PlateDetector(
+        yolo_model   = "yolov8n.pt",
+        yolo_conf    = 0.35,   # slightly lower threshold for test
+        ocr_min_conf = 0.50,
+        cooldown_sec = 3 if not is_file else 0,   # no cooldown for video
+        use_gpu      = False,
+    )
+    if not detector.ready:
+        log.error("AI models failed to load — pip install ultralytics easyocr")
+        sys.exit(1)
+
+    cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        log.error(f"Cannot open source: {source}")
+        sys.exit(1)
+
+    fps_src  = cap.get(cv2.CAP_PROP_FPS) or 25
+    delay_ms = max(1, int(1000 / fps_src)) if is_file else 1
+
+    log.info(f"✅ Source opened — press Q in the preview window to quit")
+    log.info("─" * 52)
+
+    seen_plates   = {}   # plate → count
+    frame_n       = 0
+    t_start       = time.time()
+
+    while not _shutdown:
+        ret, frame = cap.read()
+        if not ret:
+            if is_file:
+                log.info("End of video.")
+            else:
+                log.warning("Camera read failed — retrying…")
+                time.sleep(0.1)
+            break
+
+        frame_n += 1
+        # Process every 3rd frame for camera; every frame for video
+        if not is_file and frame_n % 3 != 0:
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), ord('Q'), 27):
+                break
+            continue
+
+        detections = detector.detect(frame)
+
+        for det in detections:
+            plate = det["plate"]
+            vtype = det["type"]
+            detector.mark_seen(plate)
+            seen_plates[plate] = seen_plates.get(plate, 0) + 1
+            log.info(
+                f"🚗  {plate:<12}  type={vtype:<10}  "
+                f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
+                f"(seen {seen_plates[plate]}x)"
+            )
+
+        # Draw overlay
+        vis = detector.draw(frame, detections)
+
+        # HUD: elapsed time + unique plates count
+        elapsed = int(time.time() - t_start)
+        hud     = f"  {elapsed}s  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
+        (hw, hh), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        cv2.rectangle(vis, (0, 0), (hw + 8, hh + 10), (30, 30, 30), -1)
+        cv2.putText(vis, hud, (4, hh + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+        cv2.imshow("Laventra — Test Mode", vis)
+        key = cv2.waitKey(delay_ms) & 0xFF
+        if key in (ord('q'), ord('Q'), 27):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    elapsed = int(time.time() - t_start)
+    print()
+    print("─" * 52)
+    log.info(f"Test complete — {frame_n} frames  |  {elapsed}s  |  {len(seen_plates)} unique plate(s)")
+    if seen_plates:
+        log.info("Plates detected:")
+        for plate, count in sorted(seen_plates.items(), key=lambda x: -x[1]):
+            log.info(f"  {plate:<14}  ×{count}")
+    else:
+        log.info("No plates detected")
+    print("─" * 52)
 
 
 def _run_detector() -> None:
@@ -331,6 +452,10 @@ if __name__ == "__main__":
 
     if args.status:
         _print_status()
+        sys.exit(0)
+
+    if args.test:
+        _run_test(source=args.source)
         sys.exit(0)
 
     if args.setup or not db.has_session():
