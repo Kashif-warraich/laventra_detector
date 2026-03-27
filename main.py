@@ -199,16 +199,25 @@ def _run_test(source=None) -> None:
         log.error("AI models failed to load — pip install ultralytics easyocr")
         sys.exit(1)
 
-    cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
-    if not cap.isOpened():
+    # CAP_AVFOUNDATION is a macOS live-camera backend — never use it for files
+    if is_file:
         cap = cv2.VideoCapture(src)
+    else:
+        cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(src)
+
     if not cap.isOpened():
         log.error(f"Cannot open source: {source}")
         sys.exit(1)
 
-    fps_src  = cap.get(cv2.CAP_PROP_FPS) or 25
-    delay_ms = max(1, int(1000 / fps_src)) if is_file else 1
+    fps_src      = cap.get(cv2.CAP_PROP_FPS) or 25
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    delay_ms     = max(1, int(1000 / fps_src)) if is_file else 1
 
+    if is_file:
+        duration = int(total_frames / fps_src) if fps_src else 0
+        log.info(f"  Video : {total_frames} frames  {fps_src:.0f}fps  ~{duration}s")
     log.info(f"✅ Source opened — press Q in the preview window to quit")
     log.info("─" * 52)
 
