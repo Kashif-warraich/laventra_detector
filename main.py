@@ -185,12 +185,14 @@ def _run_test(source=None) -> None:
     print("  Press Q or Ctrl+C to quit")
     print()
 
+    # yolov8s.pt is more accurate than yolov8n.pt — download it once with:
+    #   python -c "from ultralytics import YOLO; YOLO('yolov8s.pt')"
     log.info("Loading AI models…")
     detector = det_module.PlateDetector(
-        yolo_model   = "yolov8n.pt",
-        yolo_conf    = 0.35,   # slightly lower threshold for test
-        ocr_min_conf = 0.50,
-        cooldown_sec = 3 if not is_file else 0,   # no cooldown for video
+        yolo_model   = "yolov8s.pt" if __import__("os").path.exists("yolov8s.pt") else "yolov8n.pt",
+        yolo_conf    = 0.25,          # low threshold — catch everything in test
+        ocr_min_conf = 0.40,          # lower OCR bar so partial reads show
+        cooldown_sec = 0 if is_file else 3,
         use_gpu      = False,
     )
     if not detector.ready:

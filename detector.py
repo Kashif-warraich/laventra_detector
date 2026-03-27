@@ -89,24 +89,34 @@ class PlateDetector:
                 continue
 
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            crop_y = y1 + (y2 - y1) // 2
-            crop   = frame[crop_y:y2, x1:x2]
-            if crop.size == 0:
+            h = y2 - y1
+
+            # Try bottom third and bottom half — plates live near the bumper
+            candidates = [
+                frame[y1 + h * 2 // 3 : y2,  x1:x2],  # bottom third
+                frame[y1 + h // 2     : y2,  x1:x2],  # bottom half
+            ]
+
+            best_plate, best_conf = None, 0.0
+            for crop in candidates:
+                if crop.size == 0:
+                    continue
+                plate, conf = self._read_plate(crop)
+                if plate and conf > best_conf:
+                    best_plate, best_conf = plate, conf
+
+            if not best_plate:
                 continue
 
-            plate, ocr_conf = self._read_plate(crop)
-            if not plate:
-                continue
-
-            if self.on_cooldown(plate):
-                log.debug(f"⏳ {plate} cooldown ({self.cooldown_remaining(plate)}s)")
+            if self.on_cooldown(best_plate):
+                log.debug(f"⏳ {best_plate} cooldown ({self.cooldown_remaining(best_plate)}s)")
                 continue
 
             detections.append({
-                "plate":     plate,
+                "plate":     best_plate,
                 "type":      VEHICLE_CLASSES[cls_id],
                 "yolo_conf": yolo_conf,
-                "ocr_conf":  ocr_conf,
+                "ocr_conf":  best_conf,
                 "box":       (x1, y1, x2, y2),
             })
 
@@ -114,21 +124,39 @@ class PlateDetector:
 
     def _read_plate(self, crop: np.ndarray) -> tuple:
         try:
-            gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            gray  = cv2.GaussianBlur(gray, (3, 3), 0)
-            _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            rgb   = cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)
+            # ── Upscale so plate characters are at least 60 px tall ──────────
+            h, w = crop.shape[:2]
+            if h < 60:
+                scale = max(2, int(np.ceil(60 / h)))
+                crop  = cv2.resize(crop, (w * scale, h * scale),
+                                   interpolation=cv2.INTER_CUBIC)
 
-            best_text = None
-            best_conf = 0.0
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-            for (_, text, conf) in self._reader.readtext(rgb):
-                if conf < self._ocr_min_conf:
-                    continue
-                cleaned = self._clean(text)
-                if cleaned and conf > best_conf:
-                    best_text = cleaned
-                    best_conf = conf
+            # ── Build multiple preprocessing variants ────────────────────────
+            # 1. CLAHE + Otsu  — handles low contrast and uneven lighting
+            clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+            eq     = clahe.apply(gray)
+            _, bw  = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+            # 2. Inverted binary — works for dark-background plates
+            bw_inv = cv2.bitwise_not(bw)
+
+            # 3. Raw grayscale  — sometimes OCR reads better without binarization
+            variants = [
+                cv2.cvtColor(bw,     cv2.COLOR_GRAY2RGB),
+                cv2.cvtColor(bw_inv, cv2.COLOR_GRAY2RGB),
+                cv2.cvtColor(gray,   cv2.COLOR_GRAY2RGB),
+            ]
+
+            best_text, best_conf = None, 0.0
+            for img in variants:
+                for (_, text, conf) in self._reader.readtext(img):
+                    if conf < self._ocr_min_conf:
+                        continue
+                    cleaned = self._clean(text)
+                    if cleaned and conf > best_conf:
+                        best_text, best_conf = cleaned, conf
 
             return best_text, best_conf
         except Exception as e:
