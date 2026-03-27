@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Local database and logs
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# IDE / OS
+.idea/
+.claude/
+.DS_Store
+*.swp
