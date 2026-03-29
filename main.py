@@ -220,8 +220,13 @@ def _run_test(source=None) -> None:
     if is_file:
         duration = int(total_frames / fps_src) if fps_src else 0
         log.info(f"  Video : {total_frames} frames  {fps_src:.0f}fps  ~{duration}s")
+        log.info(f"  Size  : {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
     log.info("✅ Source opened — press Q in the preview window to quit")
     log.info("─" * 52)
+
+    # Target display width — keeps the window small and imshow fast
+    DISPLAY_W = 480
+    frame_interval = 1.0 / fps_src   # seconds per frame
 
     # ── Detection runs in a background thread so it never blocks the display ──
     # frame_q : main thread drops the latest frame here (size=1, always fresh)
@@ -254,9 +259,11 @@ def _run_test(source=None) -> None:
     frame_n     = 0
     t_start     = time.time()
     last_dets   = []
-    no_det_ctr  = 0   # frames since last detection — used to clear overlay
+    no_det_ctr  = 0
 
     while not _shutdown:
+        t_frame = time.time()
+
         ret, frame = cap.read()
         if not ret:
             if is_file:
@@ -268,13 +275,13 @@ def _run_test(source=None) -> None:
 
         frame_n += 1
 
-        # Feed a fresh frame to the detector (drop if it's still busy)
+        # Feed latest frame to detector — drop if busy (never block display)
         try:
             frame_q.put_nowait(frame.copy())
         except _queue.Full:
             pass
 
-        # Pick up the latest detection result (non-blocking)
+        # Pick up latest detection result (non-blocking)
         try:
             dets = result_q.get_nowait()
             if dets:
@@ -292,28 +299,37 @@ def _run_test(source=None) -> None:
                     )
             else:
                 no_det_ctr += 1
-                if no_det_ctr > 10:
+                if no_det_ctr > 20:
                     last_dets = []
         except _queue.Empty:
             pass
 
-        # Draw overlay on every frame — always smooth regardless of detection speed
-        vis = detector.draw(frame, last_dets)
+        # Resize for display — imshow on large frames (888x1920) is very slow
+        h_f, w_f = frame.shape[:2]
+        dh = int(h_f * DISPLAY_W / w_f)
+        vis = cv2.resize(detector.draw(frame, last_dets), (DISPLAY_W, dh))
 
         elapsed = int(time.time() - t_start)
         if is_file and total_frames:
             pct = int(frame_n / total_frames * 100)
-            hud = f"  {pct}%  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
+            hud = f"  {pct}%  |  {len(seen_plates)} plate(s)  |  Q=quit  "
         else:
-            hud = f"  {elapsed}s  |  {len(seen_plates)} plate(s) found  |  Q to quit  "
+            hud = f"  {elapsed}s  |  {len(seen_plates)} plate(s)  |  Q=quit  "
 
-        (hw, hh), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(vis, (0, 0), (hw + 8, hh + 10), (30, 30, 30), -1)
-        cv2.putText(vis, hud, (4, hh + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        (hw, hh), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(vis, (0, 0), (hw + 8, hh + 8), (30, 30, 30), -1)
+        cv2.putText(vis, hud, (4, hh + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         cv2.imshow("Laventra — Test Mode", vis)
-        if cv2.waitKey(delay_ms) & 0xFF in (ord('q'), ord('Q'), 27):
+        if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
             break
+
+        # Wall-clock pacing — sleep the remaining time in this frame slot
+        if is_file:
+            used = time.time() - t_frame
+            remaining = frame_interval - used
+            if remaining > 0:
+                time.sleep(remaining)
 
     det_stop.set()
     det_thread.join(timeout=3)
