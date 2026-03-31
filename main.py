@@ -36,6 +36,8 @@ def _args():
     p.add_argument("--debug",  action="store_true")
     p.add_argument("--test",   action="store_true",
                    help="Test mode: live preview window, no API posting")
+    p.add_argument("--post",   action="store_true",
+                   help="Also post detected plates to the API (use with --test)")
     p.add_argument("--source", default=None,
                    help="Video file or camera index for --test (default: configured camera)")
     return p.parse_args()
@@ -166,7 +168,7 @@ def _interactive_reconnect() -> bool:
         return False
 
 
-def _run_test(source=None) -> None:
+def _run_test(source=None, post=False) -> None:
     import os
 
     # Resolve source: explicit arg > configured camera > webcam 0
@@ -175,13 +177,33 @@ def _run_test(source=None) -> None:
     src = int(source) if str(source).strip().isdigit() else source
     is_file = isinstance(src, str) and os.path.isfile(src)
 
+    # When --post is requested, load lavvaggio/device and verify API connection
+    lav_id = lav_name = dev_id = None
+    if post:
+        lav_id, lav_name, dev_id = lav_module.load_from_db()
+        if not lav_id:
+            log.error("No lavvaggio set — run: python main.py --setup")
+            sys.exit(1)
+        auth.load_saved_token()
+        log.info("Verifying API session…")
+        result = auth.verify_connection()
+        if not result["ok"]:
+            log.error("Cannot connect to the API — run without --post or fix setup")
+            sys.exit(1)
+        log.info("✅ API session verified")
+
     print()
     print("═" * 52)
     print("  LAVENTRA DETECTOR — Test Mode")
     print("═" * 52)
     print(f"  Source  : {source}")
     print(f"  Type    : {'video file' if is_file else 'camera feed'}")
-    print(f"  API     : disabled (test only)")
+    if post:
+        print(f"  API     : enabled — posting events")
+        print(f"  Lavvaggio : {lav_name} (id={lav_id})")
+        print(f"  Device    : {dev_id or '—'}")
+    else:
+        print(f"  API     : disabled (test only)")
     print("═" * 52)
     print()
     print("  Press Q or Ctrl+C to quit")
@@ -194,7 +216,7 @@ def _run_test(source=None) -> None:
         yolo_model   = "yolov8s.pt" if __import__("os").path.exists("yolov8s.pt") else "yolov8n.pt",
         yolo_conf    = 0.25,          # low threshold — catch everything in test
         ocr_min_conf = 0.40,          # lower OCR bar so partial reads show
-        cooldown_sec = 0 if is_file else 3,
+        cooldown_sec = 30 if (post and is_file) else (0 if is_file else 3),
         use_gpu      = False,
     )
     if not detector.ready:
@@ -260,6 +282,7 @@ def _run_test(source=None) -> None:
     t_start     = time.time()
     last_dets   = []
     no_det_ctr  = 0
+    stats       = {"detected": 0, "sent": 0, "queued": 0}
 
     while not _shutdown:
         t_frame = time.time()
@@ -297,6 +320,34 @@ def _run_test(source=None) -> None:
                         f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
                         f"(seen {seen_plates[plate]}x)"
                     )
+                    if post:
+                        from datetime import timedelta
+                        now = datetime.now(timezone.utc)
+                        started_iso = now.isoformat()
+                        ended_iso   = (now + timedelta(seconds=1)).isoformat()
+                        stats["detected"] += 1
+                        ok = api.post_event(
+                            lavvaggio_id=lav_id,
+                            plate=plate,
+                            vehicle_type=vtype,
+                            started_at=started_iso,
+                            ended_at=ended_iso,
+                            device_id=dev_id,
+                        )
+                        if ok:
+                            stats["sent"] += 1
+                            log.info(f"  ✅ Event posted: {plate}")
+                        else:
+                            stats["queued"] += 1
+                            db.enqueue(
+                                lavvaggio_id=lav_id,
+                                plate=plate,
+                                vehicle_type=vtype,
+                                started_at=now_iso,
+                                ended_at=now_iso,
+                                device_id=dev_id,
+                            )
+                            log.warning(f"  ⚠️  Event queued (API failed): {plate}")
             else:
                 no_det_ctr += 1
                 if no_det_ctr > 20:
@@ -346,6 +397,12 @@ def _run_test(source=None) -> None:
             log.info(f"  {plate:<14}  ×{count}")
     else:
         log.info("No plates detected")
+    if post:
+        log.info(
+            f"Events — detected={stats['detected']}  "
+            f"sent={stats['sent']}  "
+            f"queued={stats['queued']}"
+        )
     print("─" * 52)
 
 
@@ -528,7 +585,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.test:
-        _run_test(source=args.source)
+        _run_test(source=args.source, post=args.post)
         sys.exit(0)
 
     if args.setup or not db.has_session():

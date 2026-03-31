@@ -15,6 +15,12 @@ env/
 *.db-wal
 *.log
 
+# AI models & test videos (large binary files)
+*.pt
+*.mp4
+*.mov
+*.MOV
+
 # IDE / OS
 .idea/
 .claude/
