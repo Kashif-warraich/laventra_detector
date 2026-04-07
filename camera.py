@@ -7,7 +7,9 @@ import db
 log = logging.getLogger("laventra")
 
 FAILURE_THRESHOLD = 30
-RECONNECT_DELAY   = 3
+RECONNECT_DELAY   = 10
+# 5 minutes of consecutive failure at 10s intervals = 30 attempts
+_WARN_AFTER_ATTEMPTS = 30
 
 
 class CameraStream:
@@ -95,17 +97,16 @@ class CameraStream:
             if self._cap is None or not self._cap.isOpened():
                 self._connected  = False
                 self._fail_count += 1
-                if self._fail_count >= FAILURE_THRESHOLD and not self._asking:
-                    self._asking = True
-                    new_url = self._prompt_new_url()
-                    if new_url and new_url != self._url:
-                        self.update_url(new_url)
-                    self._asking     = False
-                    self._fail_count = 0
-                log.warning(
-                    f"Camera unavailable — retry in {RECONNECT_DELAY}s "
-                    f"(attempt {self._fail_count})"
-                )
+                if self._fail_count >= _WARN_AFTER_ATTEMPTS:
+                    log.warning(
+                        f"Camera not available for {self._fail_count * RECONNECT_DELAY}s — "
+                        f"still retrying ({self._url})"
+                    )
+                else:
+                    log.info(
+                        f"Camera not available, retrying in {RECONNECT_DELAY}s... "
+                        f"(attempt {self._fail_count})"
+                    )
                 self._stop.wait(RECONNECT_DELAY)
                 self._open()
                 continue

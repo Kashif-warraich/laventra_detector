@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 import requests
 import db
 import auth
@@ -10,6 +11,11 @@ MAX_RETRIES    = 10
 RETRY_INTERVAL = 60
 _url_fails     = 0
 URL_FAIL_LIMIT = 3
+
+# Exponential backoff settings for post_event retries
+_BACKOFF_INITIAL = 5
+_BACKOFF_MAX     = 60
+_BACKOFF_RETRIES = 5
 
 
 def _v1() -> str:
@@ -69,15 +75,37 @@ def post_event(
             log.error(f"POST failed: HTTP {r.status_code} — {r.text[:150]}")
             return False
 
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            exc_type = "timeout" if isinstance(exc, requests.exceptions.Timeout) else "unreachable"
+            backoff_delay = _BACKOFF_INITIAL
+            for retry in range(1, _BACKOFF_RETRIES + 1):
+                log.warning(
+                    f"API {exc_type} — {plate} — retrying in {backoff_delay}s "
+                    f"({retry}/{_BACKOFF_RETRIES})"
+                )
+                time.sleep(backoff_delay)
+                try:
+                    r = session.post(
+                        f"{_v1()}/car_wash_events",
+                        json=payload,
+                        timeout=10,
+                    )
+                    if r.status_code in (200, 201):
+                        _url_fails = 0
+                        log.info(f"✅ Event posted → {plate} (after {retry} retries)")
+                        return True
+                    log.error(f"POST failed on retry: HTTP {r.status_code}")
+                    break
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                    backoff_delay = min(backoff_delay * 2, _BACKOFF_MAX)
+                except Exception as e:
+                    log.error(f"POST retry error ({plate}): {e}")
+                    break
             _url_fails += 1
-            log.warning(f"API unreachable ({_url_fails}/{URL_FAIL_LIMIT}) — {plate}")
+            log.warning(f"API unreachable after retries ({_url_fails}/{URL_FAIL_LIMIT}) — {plate}")
             if _url_fails >= URL_FAIL_LIMIT:
                 _url_fails = 0
                 auth.prompt_new_api_url()
-            return False
-        except requests.exceptions.Timeout:
-            log.warning(f"API timeout — {plate}")
             return False
         except Exception as e:
             log.error(f"POST error ({plate}): {e}")

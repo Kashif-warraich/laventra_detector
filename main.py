@@ -438,8 +438,19 @@ def _run_detector() -> None:
                 log.warning("Silent re-login failed")
                 _interactive_reconnect()
         elif reason == "url":
-            log.warning("API unreachable")
-            _interactive_reconnect()
+            # Backend unreachable at startup — retry every 30s indefinitely
+            log.warning("API unreachable — will retry every 30s until connected")
+            while not _shutdown:
+                time.sleep(30)
+                log.info("Retrying API connection…")
+                if auth.silent_relogin():
+                    log.info("✅ API reconnected via re-login")
+                    break
+                retry_result = auth.verify_connection()
+                if retry_result["ok"]:
+                    log.info("✅ API session verified after retry")
+                    break
+                log.warning("API still unreachable — retrying in 30s…")
         else:
             log.warning("API connection failed")
             _interactive_reconnect()
