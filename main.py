@@ -88,14 +88,38 @@ def _run_setup() -> bool:
         log.error("Setup cancelled — no lavvaggio selected")
         return False
 
+    # ── Provision a persistent device token ──
+    # After this point the detector runs against the API with the device token,
+    # not the user JWT — so the user's password can change without breaking it.
+    lav_id, lav_name, _prev_dev_id = lav_module.load_from_db()
+    log.info("Provisioning device API token…")
+    result = auth.device_setup(
+        lavvaggio_id=lav_id,
+        serial_number=db.session_get("device_serial", None),
+    )
+    if not result.get("ok"):
+        log.error(f"Device setup failed ({result.get('reason','unknown')}) — cannot continue")
+        return False
+
+    db.session_set("device_id",    result["device_id"])
+    db.session_set("device_token", result["api_token"])
+    if result.get("serial_number"):
+        db.session_set("device_serial", result["serial_number"])
+
+    # Clear the user password — the device token is what we use from now on
+    db.session_set("password", "")
+    # Also switch the shared HTTP session to the device token
+    auth.apply_device_token()
+    log.info(f"✅ Device token provisioned (device_id={result['device_id']})")
+
     cam_module.setup_camera_url()
 
-    lav_id, lav_name, dev_id = lav_module.load_from_db()
     print()
     print("═" * 52)
     print("  ✅  Setup complete!")
     print("═" * 52)
     print(f"  Lavvaggio : {lav_name} (id={lav_id})")
+    print(f"  Device    : {result['device_id']}")
     print(f"  Camera    : {db.session_get('camera_url', '—')}")
     print(f"  API       : {db.session_get('api_url')}")
     print()
@@ -407,11 +431,19 @@ def _run_test(source=None, post=False) -> None:
 
 
 def _run_detector() -> None:
-    lav_id, lav_name, dev_id = lav_module.load_from_db()
-    cam_url                  = db.session_get("camera_url", "0")
+    lav_id, lav_name, _ = lav_module.load_from_db()
+    cam_url             = db.session_get("camera_url", "0")
+    device_id_raw       = db.session_get("device_id", "")
+    dev_id              = int(device_id_raw) if device_id_raw and str(device_id_raw).isdigit() else None
+    device_token        = db.session_get("device_token", "")
 
     if not lav_id:
         log.error("No lavvaggio set — run: python main.py --setup")
+        sys.exit(1)
+
+    if not device_token:
+        log.error("No device token — your session predates this detector version.")
+        log.error("  → Please re-run: python main.py --setup")
         sys.exit(1)
 
     print()
@@ -426,39 +458,30 @@ def _run_detector() -> None:
     print("═" * 52)
     print()
 
-    auth.load_saved_token()
+    # Attach the persistent device token to the shared HTTP session.
+    # No user JWT, no re-login. Password changes never affect the detector.
+    auth.apply_device_token()
 
     log.info("Verifying API session…")
     result = auth.verify_connection()
     if not result["ok"]:
         reason = result.get("reason", "unknown")
-        if reason == "auth":
-            log.warning("Token invalid — attempting silent re-login…")
-            if not auth.silent_relogin():
-                log.warning("Silent re-login failed")
-                _interactive_reconnect()
-        elif reason == "url":
-            # Backend unreachable at startup — retry every 30s indefinitely
-            log.warning("API unreachable — will retry every 30s until connected")
-            while not _shutdown:
-                time.sleep(30)
-                log.info("Retrying API connection…")
-                if auth.silent_relogin():
-                    log.info("✅ API reconnected via re-login")
-                    break
-                retry_result = auth.verify_connection()
-                if retry_result["ok"]:
-                    log.info("✅ API session verified after retry")
-                    break
-                log.warning("API still unreachable — retrying in 30s…")
+        if reason == "url":
+            log.warning("API unreachable at startup — continuing; events will queue")
+        elif reason == "auth":
+            log.error("Device token rejected — re-run: python main.py --setup")
+            sys.exit(1)
         else:
-            log.warning("API connection failed")
-            _interactive_reconnect()
+            log.warning(f"API check returned {reason} — continuing in degraded mode")
     else:
-        log.info("✅ API session verified")
+        log.info("✅ API session verified (device token)")
 
     flusher = api.QueueFlusher()
     flusher.start()
+
+    # Start heartbeat thread — tells the backend "I'm alive" every 60s
+    heartbeat = api.HeartbeatThread(device_id=dev_id, device_token=device_token)
+    heartbeat.start()
 
     log.info("Loading AI models…")
     detector = det_module.PlateDetector(
@@ -559,6 +582,10 @@ def _run_detector() -> None:
         flusher.stop()
     except Exception as e:
         log.error(f"Flusher stop error: {e}")
+    try:
+        heartbeat.stop()
+    except Exception as e:
+        log.error(f"Heartbeat stop error: {e}")
 
     print()
     print("─" * 52)

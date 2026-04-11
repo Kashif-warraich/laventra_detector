@@ -1,7 +1,10 @@
 import cv2
 import time
+import socket
+import ipaddress
 import logging
 import threading
+from urllib.parse import urlparse, urlunparse
 import db
 
 log = logging.getLogger("laventra")
@@ -10,6 +13,52 @@ FAILURE_THRESHOLD = 30
 RECONNECT_DELAY   = 10
 # 5 minutes of consecutive failure at 10s intervals = 30 attempts
 _WARN_AFTER_ATTEMPTS = 30
+
+# ── Network-scan fallback ────────────────────────────────────────────────────
+_SCAN_PORT_TIMEOUT = 0.3
+_SCAN_VERIFY_TIMEOUT_MS = 1500
+
+
+def _extract_port(url: str):
+    """
+    Extract the port from an HTTP(S) camera URL. Returns None for numeric
+    sources (webcams) or malformed URLs.
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme in ("http", "https") and parsed.port:
+            return parsed.port
+        # Default HTTP camera ports if explicit port missing
+        if parsed.scheme == "http":
+            return 80
+        if parsed.scheme == "https":
+            return 443
+    except Exception:
+        pass
+    return None
+
+
+def _local_subnet_hosts():
+    """
+    Return an iterable of IPs in the /24 subnet the local machine is on,
+    excluding our own IP. Skips loopback and link-local.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Doesn't actually send a packet — used to pick the outbound iface
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception as e:
+        log.debug(f"Could not determine local IP: {e}")
+        return []
+
+    try:
+        net = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+    except Exception:
+        return []
+
+    return [str(h) for h in net.hosts() if str(h) != local_ip]
 
 
 class CameraStream:
@@ -81,7 +130,95 @@ class CameraStream:
                 log.warning(f"Cannot open: {self._url}")
         except Exception as e:
             log.error(f"Camera open error: {e}")
+
+        # ── Fallback: scan local subnet for the camera on the same port ──
+        # Only for HTTP(S) URLs — skip for integer webcam sources.
+        if not isinstance(src, int):
+            discovered = self._discover_camera_on_network_sync()
+            if discovered:
+                log.info(f"📡 Camera found at new address: {discovered}")
+                self._url = discovered
+                db.session_set("camera_url", discovered)
+                # Try to open the discovered URL once
+                try:
+                    cap = cv2.VideoCapture(discovered, cv2.CAP_AVFOUNDATION)
+                    if not cap.isOpened():
+                        cap = cv2.VideoCapture(discovered)
+                    if cap.isOpened():
+                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        ret, _ = cap.read()
+                        if ret:
+                            self._cap        = cap
+                            self._connected  = True
+                            self._fail_count = 0
+                            log.info(f"✅ Camera reconnected at: {discovered}")
+                            return True
+                        cap.release()
+                except Exception as e:
+                    log.error(f"Discovered camera open error: {e}")
         return False
+
+    def _discover_camera_on_network_sync(self):
+        """
+        Scans the local /24 subnet for a host listening on the configured camera
+        port, then verifies each candidate by attempting to open it with OpenCV
+        using the same path as the original URL. Returns the first working URL,
+        or None.
+        """
+        port = None
+        raw_port = db.session_get("camera_port", "")
+        if raw_port and str(raw_port).isdigit():
+            port = int(raw_port)
+        else:
+            port = _extract_port(self._url)
+        if not port:
+            return None
+
+        parsed = urlparse(self._url)
+        path   = parsed.path or "/video"
+        scheme = parsed.scheme or "http"
+
+        hosts = _local_subnet_hosts()
+        if not hosts:
+            log.debug("Camera discovery: no subnet hosts to scan")
+            return None
+
+        log.info(f"📡 Scanning local subnet for camera on port {port}…")
+        candidates = []
+        for ip in hosts:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(_SCAN_PORT_TIMEOUT)
+            try:
+                if sock.connect_ex((ip, port)) == 0:
+                    candidates.append(ip)
+            except Exception:
+                pass
+            finally:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        if not candidates:
+            log.debug(f"Camera discovery: no hosts listening on :{port}")
+            return None
+
+        log.info(f"📡 {len(candidates)} candidate host(s) — verifying with OpenCV…")
+        for ip in candidates:
+            url = urlunparse((scheme, f"{ip}:{port}", path, "", "", ""))
+            try:
+                test = cv2.VideoCapture(url)
+                if test.isOpened():
+                    test.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    ret, _ = test.read()
+                    test.release()
+                    if ret:
+                        return url
+                else:
+                    test.release()
+            except Exception:
+                pass
+        return None
 
     def _release(self) -> None:
         if self._cap:
@@ -203,6 +340,9 @@ def setup_camera_url() -> str:
 
         if ok:
             db.session_set("camera_url", url)
+            port = _extract_port(url)
+            if port:
+                db.session_set("camera_port", port)
             log.info("✅ Camera OK")
             return url
 
@@ -213,4 +353,7 @@ def setup_camera_url() -> str:
             return saved
         if skip == "y":
             db.session_set("camera_url", url)
+            port = _extract_port(url)
+            if port:
+                db.session_set("camera_port", port)
             return url

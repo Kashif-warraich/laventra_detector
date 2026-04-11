@@ -73,7 +73,8 @@ def session_clear() -> None:
 
 
 def has_session() -> bool:
-    return bool(session_get("token")) and bool(session_get("lavvaggio_id"))
+    # A "ready" session requires a device token (set during --setup) and a lavvaggio
+    return bool(session_get("device_token")) and bool(session_get("lavvaggio_id"))
 
 
 def session_summary() -> dict:
@@ -84,7 +85,9 @@ def session_summary() -> dict:
         "lavvaggio_name": session_get("lavvaggio_name", "—"),
         "device_id":      session_get("device_id",      "—"),
         "camera_url":     session_get("camera_url",     "—"),
+        "camera_port":    session_get("camera_port",    "—"),
         "token_set":      "yes" if session_get("token") else "no",
+        "device_token_set": "yes" if session_get("device_token") else "no",
     }
 
 
