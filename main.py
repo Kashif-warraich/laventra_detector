@@ -13,7 +13,22 @@ import sys
 import time
 import signal
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+
+def _utc_now() -> str:
+    """Return the current UTC time as an ISO 8601 string with Z suffix.
+
+    Uses Z (not +00:00) so JavaScript's Date constructor parses it
+    correctly in all browsers without extra frontend conversion.
+    The backend (Rails / ActiveRecord) stores it as UTC regardless.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def _utc_from_ts(ts: float) -> str:
+    """Convert a Unix timestamp to a UTC ISO 8601 string with Z suffix."""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 import cv2
 import threading
@@ -28,11 +43,194 @@ import detector as det_module
 import api
 
 
+# ── Plate-visit tracking ─────────────────────────────────────────────────────
+# How often the detector is allowed to re-detect the same plate (reduces OCR load).
+_PRESENCE_COOLDOWN = 3    # seconds
+
+# How long a plate must be absent before we declare the visit over and post the event.
+_PRESENCE_GRACE    = 8    # seconds
+
+# Minimum event duration enforced in the payload (API rejects started_at == ended_at).
+_MIN_EVENT_SECS    = 1    # seconds
+
+
+class _PlateTracker:
+    """
+    Tracks vehicles by YOLO track_id — not by plate string.
+
+    Visit lifecycle
+    ───────────────
+    ENTER  : YOLO assigns a new track_id → record started_at
+    UPDATE : same track_id seen again → update last_seen, accumulate OCR reading
+    EXIT   : track_id absent for _PRESENCE_GRACE seconds → pick best plate from
+             all accumulated readings, post ONE event
+
+    Using track_id (instead of plate string) means OCR noise across frames
+    (e.g. "FV646PR" vs "FV66PR") no longer creates duplicate events — they
+    are all collected as readings for the same physical vehicle visit.
+    The best plate is chosen by frequency first, then confidence.
+    """
+
+    def __init__(self):
+        # track_id (int) → visit dict
+        self._active: dict = {}
+
+    def update(
+        self,
+        track_id:     int,
+        vehicle_type: str,
+        plate:        str   = None,
+        ocr_conf:     float = 0.0,
+    ) -> bool:
+        """
+        Record a frame for this track. Returns True if it is a brand-new visit.
+        plate may be None when YOLO sees the vehicle but OCR hasn't read yet.
+        """
+        now_ts  = time.time()
+        now_iso = _utc_now()
+
+        if track_id not in self._active:
+            self._active[track_id] = {
+                "started_ts":    now_ts,
+                "started_iso":   now_iso,
+                "last_seen_ts":  now_ts,
+                "last_seen_iso": now_iso,
+                "vehicle_type":  vehicle_type,
+                "readings":      [],   # [(plate_str, ocr_conf), ...]
+            }
+            is_new = True
+        else:
+            v = self._active[track_id]
+            v["last_seen_ts"]  = now_ts
+            v["last_seen_iso"] = now_iso
+            is_new = False
+
+        if plate:
+            self._active[track_id]["readings"].append((plate, ocr_conf))
+
+        return is_new
+
+    def collect_completed(self, grace: float = _PRESENCE_GRACE) -> list:
+        """
+        Return finalised events for tracks absent for at least `grace` seconds.
+        Tracks with zero plate readings are silently discarded (car never identified).
+        """
+        now_ts    = time.time()
+        completed = []
+        for tid, v in list(self._active.items()):
+            if now_ts - v["last_seen_ts"] >= grace:
+                evt = _PlateTracker._make_event(tid, v)
+                if evt:
+                    completed.append(evt)
+                else:
+                    log.debug(f"Track #{tid}: no plate readings — skipping event")
+                del self._active[tid]
+        return completed
+
+    def flush(self) -> list:
+        """Force-complete all active visits (shutdown)."""
+        completed = [e for e in
+                     (_PlateTracker._make_event(t, v) for t, v in self._active.items())
+                     if e]
+        self._active.clear()
+        return completed
+
+    @staticmethod
+    def _best_plate(readings: list) -> tuple:
+        """
+        Given [(plate, conf), …] return (best_plate_str, best_conf).
+
+        Strategy: prefer the plate string that appears most often across frames
+        (handles OCR noise). Break ties by highest confidence.
+        """
+        from collections import Counter
+        if not readings:
+            return None, 0.0
+
+        freq      = Counter(p for p, _ in readings)
+        max_freq  = freq.most_common(1)[0][1]
+        # Candidates: all plates tied for highest frequency
+        top       = {p for p, f in freq.items() if f == max_freq}
+        # Among those, pick the one with the highest single-reading confidence
+        best_plate, best_conf = max(
+            ((p, c) for p, c in readings if p in top),
+            key=lambda x: x[1],
+        )
+        return best_plate, best_conf
+
+    @staticmethod
+    def _make_event(track_id: int, v: dict):
+        plate, ocr_conf = _PlateTracker._best_plate(v["readings"])
+        if not plate:
+            return None   # never got a valid plate read
+
+        started_ts  = v["started_ts"]
+        started_iso = v["started_iso"]
+        last_ts     = v["last_seen_ts"]
+        last_iso    = v["last_seen_iso"]
+
+        # API requires ended_at strictly after started_at
+        if last_ts < started_ts + _MIN_EVENT_SECS:
+            ended_iso = _utc_from_ts(started_ts + _MIN_EVENT_SECS)
+        else:
+            ended_iso = last_iso
+
+        return {
+            "plate":        plate,
+            "vehicle_type": v["vehicle_type"],
+            "started_at":   started_iso,
+            "ended_at":     ended_iso,
+            "ocr_conf":     ocr_conf,
+            "track_id":     track_id,
+            "reading_count": len(v["readings"]),
+            "all_readings": v["readings"],   # for debug logging
+        }
+
+
+def _post_event_and_queue(evt: dict, lav_id: int, dev_id, stats: dict) -> None:
+    """Post a completed visit event; fall back to the offline queue on network failure."""
+    plate      = evt["plate"]
+    n_readings = evt.get("reading_count", "?")
+    ocr_conf   = evt.get("ocr_conf", 0.0)
+    log.info(
+        f"📋  Posting event: {plate}  "
+        f"{evt['started_at']}  →  {evt['ended_at']}  "
+        f"(track #{evt.get('track_id','?')}  {n_readings} readings  ocr={ocr_conf:.0%})"
+    )
+    result = api.post_event(
+        lavvaggio_id=lav_id,
+        plate=plate,
+        vehicle_type=evt["vehicle_type"],
+        started_at=evt["started_at"],
+        ended_at=evt["ended_at"],
+        device_id=dev_id,
+    )
+    if result is True:
+        stats["sent"] += 1
+    elif result is api._PERMANENT_FAILURE:
+        # Payload was permanently rejected (422/401) — no point queuing it
+        log.warning(f"⚠️  Event for {plate} permanently rejected — not queued")
+    else:
+        # Network/temporary failure — queue for later retry
+        stats["queued"] += 1
+        db.enqueue(
+            lavvaggio_id=lav_id,
+            plate=plate,
+            vehicle_type=evt["vehicle_type"],
+            started_at=evt["started_at"],
+            ended_at=evt["ended_at"],
+            device_id=dev_id,
+        )
+        log.info(f"📥 Queued offline → {plate}")
+
+
 def _args():
     p = argparse.ArgumentParser()
     p.add_argument("--setup",  action="store_true")
     p.add_argument("--status", action="store_true")
-    p.add_argument("--reset",  action="store_true")
+    p.add_argument("--reset",       action="store_true")
+    p.add_argument("--clear-queue", action="store_true",
+                   help="Delete all queued events and exit")
     p.add_argument("--debug",  action="store_true")
     p.add_argument("--test",   action="store_true",
                    help="Test mode: live preview window, no API posting")
@@ -247,13 +445,12 @@ def _run_test(source=None, post=False) -> None:
         log.error("AI models failed to load — pip install ultralytics easyocr")
         sys.exit(1)
 
-    # CAP_AVFOUNDATION is a macOS live-camera backend — never use it for files
+    # CAP_AVFOUNDATION only works for local device indices on macOS.
+    # HTTP streams (DroidCam, IP Webcam) use _MJPEGCapture which is reliable.
     if is_file:
         cap = cv2.VideoCapture(src)
     else:
-        cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(src)
+        cap = cam_module._open_cap(src)
 
     if not cap.isOpened():
         log.error(f"Cannot open source: {source}")
@@ -335,43 +532,44 @@ def _run_test(source=None, post=False) -> None:
                 no_det_ctr = 0
                 last_dets  = dets
                 for det in dets:
-                    plate = det["plate"]
-                    vtype = det["type"]
-                    detector.mark_seen(plate)
-                    seen_plates[plate] = seen_plates.get(plate, 0) + 1
-                    log.info(
-                        f"🚗  {plate:<12}  type={vtype:<10}  "
-                        f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
-                        f"(seen {seen_plates[plate]}x)"
-                    )
-                    if post:
-                        from datetime import timedelta
-                        now = datetime.now(timezone.utc)
-                        started_iso = now.isoformat()
-                        ended_iso   = (now + timedelta(seconds=1)).isoformat()
-                        stats["detected"] += 1
-                        ok = api.post_event(
-                            lavvaggio_id=lav_id,
-                            plate=plate,
-                            vehicle_type=vtype,
-                            started_at=started_iso,
-                            ended_at=ended_iso,
-                            device_id=dev_id,
+                    plate    = det["plate"]     # may be None while reading
+                    vtype    = det["type"]
+                    track_id = det["track_id"]
+                    # mark_seen is now handled inside detector; skip external call
+                    if plate:
+                        seen_plates[plate] = seen_plates.get(plate, 0) + 1
+                        log.info(
+                            f"🚗  #{track_id}  {plate:<12}  type={vtype:<10}  "
+                            f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
+                            f"(seen {seen_plates[plate]}x)"
                         )
-                        if ok:
-                            stats["sent"] += 1
-                            log.info(f"  ✅ Event posted: {plate}")
-                        else:
-                            stats["queued"] += 1
-                            db.enqueue(
+                        if post:
+                            now_ts2     = time.time()
+                            started_iso = _utc_now()
+                            ended_iso   = _utc_from_ts(now_ts2 + 1)
+                            stats["detected"] += 1
+                            result = api.post_event(
                                 lavvaggio_id=lav_id,
                                 plate=plate,
                                 vehicle_type=vtype,
-                                started_at=now_iso,
-                                ended_at=now_iso,
+                                started_at=started_iso,
+                                ended_at=ended_iso,
                                 device_id=dev_id,
                             )
-                            log.warning(f"  ⚠️  Event queued (API failed): {plate}")
+                            if result is True:
+                                stats["sent"] += 1
+                                log.info(f"  ✅ Event posted: {plate}")
+                            elif result is not api._PERMANENT_FAILURE:
+                                stats["queued"] += 1
+                                db.enqueue(
+                                    lavvaggio_id=lav_id,
+                                    plate=plate,
+                                    vehicle_type=vtype,
+                                    started_at=started_iso,
+                                    ended_at=ended_iso,
+                                    device_id=dev_id,
+                                )
+                                log.warning(f"  ⚠️  Event queued (API failed): {plate}")
             else:
                 no_det_ctr += 1
                 if no_det_ctr > 20:
@@ -479,16 +677,12 @@ def _run_detector() -> None:
     flusher = api.QueueFlusher()
     flusher.start()
 
-    # Start heartbeat thread — tells the backend "I'm alive" every 60s
-    heartbeat = api.HeartbeatThread(device_id=dev_id, device_token=device_token)
-    heartbeat.start()
-
     log.info("Loading AI models…")
     detector = det_module.PlateDetector(
         yolo_model   = "yolov8n.pt",
         yolo_conf    = 0.40,
         ocr_min_conf = 0.55,
-        cooldown_sec = 30,
+        cooldown_sec = _PRESENCE_COOLDOWN,
         use_gpu      = False,
     )
     if not detector.ready:
@@ -499,9 +693,20 @@ def _run_detector() -> None:
     camera = cam_module.CameraStream(cam_url)
     camera.start()
 
+    # Start heartbeat thread — tells the backend "I'm alive" every 60s.
+    # Also reports camera connectivity so the backend can track it independently.
+    heartbeat = api.HeartbeatThread(
+        device_id=dev_id,
+        device_token=device_token,
+        camera_status_fn=lambda: camera.connected,
+    )
+    heartbeat.start()
+
     log.info("✅ Detector running — press Ctrl+C to stop")
+    log.info(f"   Plate tracking: cooldown={_PRESENCE_COOLDOWN}s  grace={_PRESENCE_GRACE}s")
     log.info("─" * 52)
 
+    tracker    = _PlateTracker()
     stats      = {"detected": 0, "sent": 0, "queued": 0}
     last_stats = time.time()
     frame_n    = 0
@@ -510,6 +715,9 @@ def _run_detector() -> None:
         try:
             frame = camera.read()
             if frame is None:
+                # Camera not ready — still check for visits that have ended
+                for evt in tracker.collect_completed():
+                    _post_event_and_queue(evt, lav_id, dev_id, stats)
                 time.sleep(0.05)
                 continue
 
@@ -520,49 +728,42 @@ def _run_detector() -> None:
             detections = detector.detect(frame)
 
             for det in detections:
-                plate   = det["plate"]
-                vtype   = det["type"]
-                now_iso = datetime.now(timezone.utc).isoformat()
+                track_id = det["track_id"]
+                vtype    = det["type"]
+                plate    = det["plate"]    # None when OCR not yet read
+                ocr_conf = det["ocr_conf"]
 
-                stats["detected"] += 1
-                log.info(
-                    f"🚗  {plate:<12}  "
-                    f"type={vtype:<12}  "
-                    f"yolo={det['yolo_conf']:.0%}  "
-                    f"ocr={det['ocr_conf']:.0%}"
-                )
+                # mark_seen() is now called inside detector._detect_inner()
+                # when OCR succeeds — no external call needed here.
 
-                detector.mark_seen(plate)
+                is_new = tracker.update(track_id, vtype, plate, ocr_conf)
 
-                ok = api.post_event(
-                    lavvaggio_id=lav_id,
-                    plate=plate,
-                    vehicle_type=vtype,
-                    started_at=now_iso,
-                    ended_at=now_iso,
-                    device_id=dev_id,
-                )
-
-                if ok:
-                    stats["sent"] += 1
-                else:
-                    stats["queued"] += 1
-                    db.enqueue(
-                        lavvaggio_id=lav_id,
-                        plate=plate,
-                        vehicle_type=vtype,
-                        started_at=now_iso,
-                        ended_at=now_iso,
-                        device_id=dev_id,
+                if plate:
+                    stats["detected"] += 1
+                    log.info(
+                        f"🚗  #{track_id}  {plate:<12}  type={vtype:<12}  "
+                        f"yolo={det['yolo_conf']:.0%}  ocr={ocr_conf:.0%}"
+                        + ("  [arrived]" if is_new else "")
+                    )
+                elif is_new:
+                    log.info(
+                        f"🚗  #{track_id}  (reading plate…)  type={vtype:<12}  "
+                        f"yolo={det['yolo_conf']:.0%}  [arrived]"
                     )
 
+            # Post events for cars that have been absent for _PRESENCE_GRACE seconds
+            for evt in tracker.collect_completed():
+                _post_event_and_queue(evt, lav_id, dev_id, stats)
+
             if time.time() - last_stats >= 60:
-                cam_ok = "✅" if camera.connected else "❌ reconnecting"
+                active  = len(tracker._active)
+                cam_ok  = "✅" if camera.connected else "❌ reconnecting"
                 log.info(
                     f"📊  detected={stats['detected']}  "
                     f"sent={stats['sent']}  "
                     f"queued={stats['queued']}  "
                     f"pending={db.queue_count()}  "
+                    f"active_visits={active}  "
                     f"camera={cam_ok}"
                 )
                 last_stats = time.time()
@@ -572,6 +773,11 @@ def _run_detector() -> None:
         except Exception as e:
             log.error(f"Main loop error (continuing): {e}")
             time.sleep(0.1)
+
+    # Finalise any visits still active at shutdown
+    log.info("Finalising active visits before shutdown…")
+    for evt in tracker.flush():
+        _post_event_and_queue(evt, lav_id, dev_id, stats)
 
     log.info("Shutting down…")
     try:
@@ -616,6 +822,11 @@ if __name__ == "__main__":
             log.info("✅ Session cleared")
         else:
             log.info("Cancelled")
+        sys.exit(0)
+
+    if args.clear_queue:
+        n = db.queue_clear()
+        print(f"✅ Cleared {n} queued event(s)")
         sys.exit(0)
 
     if args.status:

@@ -3,6 +3,10 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
 log     = logging.getLogger("laventra")
 DB_PATH = Path(__file__).parent / "laventra.db"
 
@@ -100,7 +104,7 @@ def enqueue(
     device_id: int = None,
 ) -> None:
     try:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now()
         with _conn() as con:
             con.execute(
                 """
@@ -144,7 +148,7 @@ def mark_sent(event_id: int) -> None:
 
 def mark_failed(event_id: int) -> None:
     try:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now()
         with _conn() as con:
             con.execute(
                 """
@@ -157,6 +161,19 @@ def mark_failed(event_id: int) -> None:
             )
     except Exception as e:
         log.error(f"Failed to update retry count {event_id}: {e}")
+
+
+def queue_clear() -> int:
+    """Delete all queued events. Returns the number of rows removed."""
+    try:
+        with _conn() as con:
+            n = con.execute("SELECT COUNT(*) as n FROM queue").fetchone()["n"]
+            con.execute("DELETE FROM queue")
+        log.info(f"Queue cleared ({n} event(s) removed)")
+        return n
+    except Exception as e:
+        log.error(f"Failed to clear queue: {e}")
+        return 0
 
 
 def queue_count(max_retries: int = 10) -> int:

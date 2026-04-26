@@ -4,6 +4,8 @@ import socket
 import ipaddress
 import logging
 import threading
+import numpy as np
+import requests
 from urllib.parse import urlparse, urlunparse
 import db
 
@@ -17,6 +19,118 @@ _WARN_AFTER_ATTEMPTS = 30
 # ── Network-scan fallback ────────────────────────────────────────────────────
 _SCAN_PORT_TIMEOUT = 0.3
 _SCAN_VERIFY_TIMEOUT_MS = 1500
+
+
+class _MJPEGCapture:
+    """
+    Pure-Python MJPEG-over-HTTP reader using requests (streaming).
+
+    Replaces cv2.VideoCapture for HTTP(S) sources on macOS where
+    AVFoundation cannot handle URLs and FFmpeg is unreliable for
+    multipart MJPEG streams (e.g. DroidCam, IP Webcam).
+
+    Exposes the same minimal interface as cv2.VideoCapture so it
+    can be used as a drop-in replacement: isOpened(), read(),
+    release(), set(), get().
+    """
+
+    _CHUNK = 8192
+
+    def __init__(self, url: str, timeout: float = 8.0):
+        self._url      = url
+        self._timeout  = timeout
+        self._response = None
+        self._iter     = None
+        self._buf      = b''
+        self._opened   = False
+        self._connect()
+
+    def _connect(self) -> None:
+        try:
+            self._response = requests.get(
+                self._url,
+                stream=True,
+                timeout=self._timeout,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            self._response.raise_for_status()
+            self._iter   = self._response.iter_content(chunk_size=self._CHUNK)
+            self._buf    = b''
+            self._opened = True
+        except requests.exceptions.ConnectionError as e:
+            log.warning(f"Camera unreachable ({self._url}) — is DroidCam open on the phone? ({e})")
+            self._opened = False
+        except Exception as e:
+            log.warning(f"MJPEG connect failed ({self._url}): {e}")
+            self._opened = False
+
+    def isOpened(self) -> bool:
+        return self._opened
+
+    def read(self):
+        if not self._opened or self._iter is None:
+            return False, None
+        try:
+            while True:
+                # Find JPEG start marker
+                a = self._buf.find(b'\xff\xd8')
+                if a == -1:
+                    chunk = next(self._iter, None)
+                    if chunk is None:
+                        self._opened = False
+                        return False, None
+                    self._buf += chunk
+                    continue
+
+                # Find JPEG end marker after the start
+                b = self._buf.find(b'\xff\xd9', a + 2)
+                if b == -1:
+                    chunk = next(self._iter, None)
+                    if chunk is None:
+                        self._opened = False
+                        return False, None
+                    self._buf += chunk
+                    continue
+
+                jpg        = self._buf[a : b + 2]
+                self._buf  = self._buf[b + 2:]
+                arr        = np.frombuffer(jpg, dtype=np.uint8)
+                frame      = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    return True, frame
+                # Corrupt JPEG — keep scanning
+        except Exception as e:
+            log.warning(f"MJPEG stream error: {e}")
+            self._opened = False
+            return False, None
+
+    def release(self) -> None:
+        self._opened = False
+        self._iter   = None
+        if self._response:
+            try:
+                self._response.close()
+            except Exception:
+                pass
+            self._response = None
+
+    # Stubs so code that calls cap.set()/cap.get() doesn't break
+    def set(self, *args):  pass
+    def get(self, *args):  return 0.0
+
+
+def _open_cap(src):
+    """
+    Return the right capture object for a given source.
+    - int   → cv2.VideoCapture with AVFoundation (local webcam)
+    - str   → _MJPEGCapture (HTTP/RTSP from DroidCam, IP Webcam, etc.)
+    """
+    if isinstance(src, int):
+        cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(src)
+        return cap
+    return _MJPEGCapture(src)
 
 
 def _extract_port(url: str):
@@ -112,11 +226,10 @@ class CameraStream:
         self._release()
         src = int(self._url) if str(self._url).strip().isdigit() else self._url
         try:
-            cap = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(src)
-            if cap.isOpened():
+            cap = _open_cap(src)
+            if isinstance(src, int):
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if cap.isOpened():
                 ret, _ = cap.read()
                 if ret:
                     self._cap        = cap
@@ -131,9 +244,22 @@ class CameraStream:
         except Exception as e:
             log.error(f"Camera open error: {e}")
 
-        # ── Fallback: scan local subnet for the camera on the same port ──
-        # Only for HTTP(S) URLs — skip for integer webcam sources.
-        if not isinstance(src, int):
+        # ── Fallback: scan local subnet for a camera that moved IP ──
+        # Only run the scan if the configured host was reachable but not
+        # streaming (i.e. port is open but wrong path or stale IP).
+        # Skip when the host is simply offline — that wastes 30+ seconds
+        # scanning 254 hosts and delays the normal reconnect retry.
+        host = urlparse(self._url).hostname if isinstance(src, str) else None
+        host_reachable = False
+        if host:
+            port = _extract_port(self._url)
+            if port:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                host_reachable = sock.connect_ex((host, port)) == 0
+                sock.close()
+
+        if not isinstance(src, int) and host_reachable:
             discovered = self._discover_camera_on_network_sync()
             if discovered:
                 log.info(f"📡 Camera found at new address: {discovered}")
@@ -141,11 +267,8 @@ class CameraStream:
                 db.session_set("camera_url", discovered)
                 # Try to open the discovered URL once
                 try:
-                    cap = cv2.VideoCapture(discovered, cv2.CAP_AVFOUNDATION)
-                    if not cap.isOpened():
-                        cap = cv2.VideoCapture(discovered)
+                    cap = _open_cap(discovered)
                     if cap.isOpened():
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                         ret, _ = cap.read()
                         if ret:
                             self._cap        = cap
@@ -241,8 +364,8 @@ class CameraStream:
                     )
                 else:
                     log.info(
-                        f"Camera not available, retrying in {RECONNECT_DELAY}s... "
-                        f"(attempt {self._fail_count})"
+                        f"Camera not available — make sure DroidCam is open on the phone. "
+                        f"Retrying in {RECONNECT_DELAY}s... (attempt {self._fail_count})"
                     )
                 self._stop.wait(RECONNECT_DELAY)
                 self._open()
@@ -295,10 +418,8 @@ class CameraStream:
             except (EOFError, KeyboardInterrupt):
                 return self._url
             src  = int(new_url) if new_url.strip().isdigit() else new_url
-            test = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
-            if not test.isOpened():
-                test = cv2.VideoCapture(src)
-            ok = test.isOpened()
+            test = _open_cap(src)
+            ok   = test.isOpened()
             test.release()
             if ok:
                 return new_url
@@ -332,10 +453,11 @@ def setup_camera_url() -> str:
 
         log.info(f"Testing {url} …")
         src  = int(url) if url.strip().isdigit() else url
-        test = cv2.VideoCapture(src, cv2.CAP_AVFOUNDATION)
-        if not test.isOpened():
-            test = cv2.VideoCapture(src)
-        ok = test.isOpened()
+        test = _open_cap(src)
+        ok   = False
+        if test.isOpened():
+            ret, _ = test.read()
+            ok = ret
         test.release()
 
         if ok:
