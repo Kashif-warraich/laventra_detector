@@ -192,6 +192,7 @@ def _post_event_and_queue(evt: dict, lav_id: int, dev_id, stats: dict) -> None:
     plate      = evt["plate"]
     n_readings = evt.get("reading_count", "?")
     ocr_conf   = evt.get("ocr_conf", 0.0)
+    confidence_pct = round(ocr_conf * 100, 2)  # backend stores 0–100, detector tracks 0–1
     log.info(
         f"📋  Posting event: {plate}  "
         f"{evt['started_at']}  →  {evt['ended_at']}  "
@@ -204,6 +205,7 @@ def _post_event_and_queue(evt: dict, lav_id: int, dev_id, stats: dict) -> None:
         started_at=evt["started_at"],
         ended_at=evt["ended_at"],
         device_id=dev_id,
+        confidence=confidence_pct,
     )
     if result is True:
         stats["sent"] += 1
@@ -220,6 +222,7 @@ def _post_event_and_queue(evt: dict, lav_id: int, dev_id, stats: dict) -> None:
             started_at=evt["started_at"],
             ended_at=evt["ended_at"],
             device_id=dev_id,
+            confidence=confidence_pct,
         )
         log.info(f"📥 Queued offline → {plate}")
 
@@ -555,6 +558,7 @@ def _run_test(source=None, post=False) -> None:
                                 started_at=started_iso,
                                 ended_at=ended_iso,
                                 device_id=dev_id,
+                                confidence=round(det["ocr_conf"] * 100, 2),
                             )
                             if result is True:
                                 stats["sent"] += 1

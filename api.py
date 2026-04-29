@@ -35,20 +35,24 @@ def post_event(
     started_at: str,
     ended_at: str,
     device_id: int = None,
+    confidence: float = None,
 ):
     global _url_fails
 
     # The Rails API infers lavvaggio_id and device_id from the authenticated
     # device token — sending them inside car_wash_event triggers an
     # "Unpermitted parameters" warning and they are silently stripped.
-    payload = {
-        "car_wash_event": {
-            "vehicle_plate": plate,
-            "vehicle_type":  vehicle_type,
-            "started_at":    started_at,
-            "ended_at":      ended_at,
-        }
+    event_body = {
+        "vehicle_plate": plate,
+        "vehicle_type":  vehicle_type,
+        "started_at":    started_at,
+        "ended_at":      ended_at,
     }
+    # Confidence is stored as a percentage (0–100). Detector tracks 0–1 floats,
+    # so callers convert before passing in.
+    if confidence is not None:
+        event_body["confidence"] = round(float(confidence), 2)
+    payload = {"car_wash_event": event_body}
 
     # Always attach the persistent device token. We never re-login — if the token
     # is rejected, it means the device was revoked and only --setup can fix it.
@@ -158,6 +162,7 @@ class QueueFlusher:
                 started_at=row["started_at"],
                 ended_at=row["ended_at"],
                 device_id=row["device_id"],
+                confidence=row["confidence"] if "confidence" in row.keys() else None,
             )
             if result is True:
                 db.mark_sent(row["id"])

@@ -33,11 +33,18 @@ def init() -> None:
                 vehicle_type  TEXT    NOT NULL DEFAULT 'unknown',
                 started_at    TEXT    NOT NULL,
                 ended_at      TEXT    NOT NULL,
+                confidence    REAL,
                 retry_count   INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT    NOT NULL,
                 last_tried_at TEXT
             );
         """)
+        # Idempotent upgrade for existing installs created before the column
+        # was added to the schema above.
+        try:
+            con.execute("ALTER TABLE queue ADD COLUMN confidence REAL")
+        except sqlite3.OperationalError:
+            pass
     log.debug(f"DB ready → {DB_PATH}")
 
 
@@ -102,6 +109,7 @@ def enqueue(
     started_at: str,
     ended_at: str,
     device_id: int = None,
+    confidence: float = None,
 ) -> None:
     try:
         now = _utc_now()
@@ -110,11 +118,11 @@ def enqueue(
                 """
                 INSERT INTO queue
                   (lavvaggio_id, device_id, plate, vehicle_type,
-                   started_at, ended_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                   started_at, ended_at, confidence, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (lavvaggio_id, device_id, plate, vehicle_type,
-                 started_at, ended_at, now),
+                 started_at, ended_at, confidence, now),
             )
         log.info(f"📥 Queued offline → {plate}")
     except Exception as e:
