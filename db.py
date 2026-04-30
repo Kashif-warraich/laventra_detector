@@ -3,6 +3,10 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
 log     = logging.getLogger("laventra")
 DB_PATH = Path(__file__).parent / "laventra.db"
 
@@ -29,11 +33,18 @@ def init() -> None:
                 vehicle_type  TEXT    NOT NULL DEFAULT 'unknown',
                 started_at    TEXT    NOT NULL,
                 ended_at      TEXT    NOT NULL,
+                confidence    REAL,
                 retry_count   INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT    NOT NULL,
                 last_tried_at TEXT
             );
         """)
+        # Idempotent upgrade for existing installs created before the column
+        # was added to the schema above.
+        try:
+            con.execute("ALTER TABLE queue ADD COLUMN confidence REAL")
+        except sqlite3.OperationalError:
+            pass
     log.debug(f"DB ready → {DB_PATH}")
 
 
@@ -73,7 +84,8 @@ def session_clear() -> None:
 
 
 def has_session() -> bool:
-    return bool(session_get("token")) and bool(session_get("lavvaggio_id"))
+    # A "ready" session requires a device token (set during --setup) and a lavvaggio
+    return bool(session_get("device_token")) and bool(session_get("lavvaggio_id"))
 
 
 def session_summary() -> dict:
@@ -84,7 +96,9 @@ def session_summary() -> dict:
         "lavvaggio_name": session_get("lavvaggio_name", "—"),
         "device_id":      session_get("device_id",      "—"),
         "camera_url":     session_get("camera_url",     "—"),
+        "camera_port":    session_get("camera_port",    "—"),
         "token_set":      "yes" if session_get("token") else "no",
+        "device_token_set": "yes" if session_get("device_token") else "no",
     }
 
 
@@ -95,19 +109,20 @@ def enqueue(
     started_at: str,
     ended_at: str,
     device_id: int = None,
+    confidence: float = None,
 ) -> None:
     try:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now()
         with _conn() as con:
             con.execute(
                 """
                 INSERT INTO queue
                   (lavvaggio_id, device_id, plate, vehicle_type,
-                   started_at, ended_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                   started_at, ended_at, confidence, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (lavvaggio_id, device_id, plate, vehicle_type,
-                 started_at, ended_at, now),
+                 started_at, ended_at, confidence, now),
             )
         log.info(f"📥 Queued offline → {plate}")
     except Exception as e:
@@ -141,7 +156,7 @@ def mark_sent(event_id: int) -> None:
 
 def mark_failed(event_id: int) -> None:
     try:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _utc_now()
         with _conn() as con:
             con.execute(
                 """
@@ -154,6 +169,19 @@ def mark_failed(event_id: int) -> None:
             )
     except Exception as e:
         log.error(f"Failed to update retry count {event_id}: {e}")
+
+
+def queue_clear() -> int:
+    """Delete all queued events. Returns the number of rows removed."""
+    try:
+        with _conn() as con:
+            n = con.execute("SELECT COUNT(*) as n FROM queue").fetchone()["n"]
+            con.execute("DELETE FROM queue")
+        log.info(f"Queue cleared ({n} event(s) removed)")
+        return n
+    except Exception as e:
+        log.error(f"Failed to clear queue: {e}")
+        return 0
 
 
 def queue_count(max_retries: int = 10) -> int:

@@ -137,6 +137,68 @@ def load_saved_token() -> bool:
     return False
 
 
+def apply_device_token() -> bool:
+    """
+    Switches the shared requests session to use the persistent device API token.
+    Called after setup and on every normal startup — the device token does not
+    expire when the user changes their password.
+    """
+    dev_token = db.session_get("device_token", "")
+    if not dev_token:
+        return False
+    _apply_token(dev_token)
+    return True
+
+
+def device_setup(lavvaggio_id: int, serial_number: str = None) -> dict:
+    """
+    Calls POST /api/v1/devices/setup with the current user JWT to mint a
+    persistent device API token. Returns {"ok": True, "device_id": ..., "api_token": ...}
+    on success or {"ok": False, "reason": "..."} on failure.
+
+    After success the raw token is ONLY returned once by the backend — we must
+    persist it immediately.
+    """
+    api_url = db.session_get("api_url", "")
+    if not api_url:
+        return {"ok": False, "reason": "no_api_url"}
+
+    payload = {"lavvaggio_id": lavvaggio_id}
+    if serial_number:
+        payload["serial_number"] = serial_number
+
+    try:
+        r = _session.post(f"{_v1(api_url)}/devices/setup", json=payload, timeout=10)
+    except requests.exceptions.ConnectionError:
+        log.error("Cannot reach API for device setup")
+        return {"ok": False, "reason": "unreachable"}
+    except requests.exceptions.Timeout:
+        log.error("Device setup timed out")
+        return {"ok": False, "reason": "timeout"}
+    except Exception as e:
+        log.error(f"Device setup error: {e}")
+        return {"ok": False, "reason": "error"}
+
+    if r.status_code == 200:
+        body = r.json().get("data", {})
+        device_id = body.get("device_id")
+        api_token = body.get("api_token")
+        if not (device_id and api_token):
+            log.error("Device setup returned OK but missing device_id/api_token")
+            return {"ok": False, "reason": "bad_response"}
+        return {"ok": True, "device_id": device_id, "api_token": api_token,
+                "serial_number": body.get("serial_number")}
+
+    if r.status_code == 401:
+        log.error("Device setup unauthorized — session expired")
+        return {"ok": False, "reason": "auth"}
+    if r.status_code == 403:
+        log.error("Device setup forbidden — your account cannot register devices")
+        return {"ok": False, "reason": "forbidden"}
+    log.error(f"Device setup failed: HTTP {r.status_code} — {r.text[:200]}")
+    return {"ok": False, "reason": f"http_{r.status_code}"}
+
+
 def verify_connection() -> dict:
     """
     Returns {"ok": True} or {"ok": False, "reason": "auth"|"url"|"unknown"}
