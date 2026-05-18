@@ -1,250 +1,48 @@
 """
-python main.py                         → run (setup on first launch)
-python main.py --setup                 → re-run setup
-python main.py --status                → show config and exit
-python main.py --reset                 → clear session and start fresh
-python main.py --debug                 → verbose logging
-python main.py --test                  → test with configured camera (no API)
-python main.py --test --source FILE    → test with a video file (no API)
-python main.py --test --source 0       → test with laptop webcam (no API)
-"""
+Laventra detector — edge-device entry point.
 
+Common operations
+─────────────────
+  python main.py --activate XXXX-YYYY-ZZZZ           Activate this device.
+                                                       (One-time. Admin issues the
+                                                        code from the web UI.)
+  python main.py --select-camera                      Pick which camera to stream.
+  python main.py --status                             Show config + license + queue.
+  python main.py                                      Run the detector.
+  python main.py --debug                              Run with verbose logging.
+  python main.py --test --source FILE                Test mode on a video file.
+  python main.py --deactivate                        Clear license + queue.
+  python main.py --show-deadletter                   Print permanently-rejected events.
+  python main.py --clear-queue                        Drop the offline retry queue.
+
+There is no password, no login, no relogin. The license JWT (issued by the
+admin's web console) is the only credential. If the backend revokes it the
+detector exits 2 and the operator re-activates.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
 import sys
 import time
-import signal
-import argparse
-from datetime import datetime, timezone, timedelta
-
-
-def _utc_now() -> str:
-    """Return the current UTC time as an ISO 8601 string with Z suffix.
-
-    Uses Z (not +00:00) so JavaScript's Date constructor parses it
-    correctly in all browsers without extra frontend conversion.
-    The backend (Rails / ActiveRecord) stores it as UTC regardless.
-    """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-
-def _utc_from_ts(ts: float) -> str:
-    """Convert a Unix timestamp to a UTC ISO 8601 string with Z suffix."""
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 import cv2
-import threading
-import queue as _queue
 
-import log_setup
+import config
 import db
-import auth
-import lavvaggio as lav_module
-import camera as cam_module
-import detector as det_module
+import log_setup
+import license as license_module
+import cameras as cameras_module
+import camera as camera_module
+import detector as detector_module
+import tracker as tracker_module
 import api
+import events as events_module
 
-
-# ── Plate-visit tracking ─────────────────────────────────────────────────────
-# How often the detector is allowed to re-detect the same plate (reduces OCR load).
-_PRESENCE_COOLDOWN = 3    # seconds
-
-# How long a plate must be absent before we declare the visit over and post the event.
-_PRESENCE_GRACE    = 8    # seconds
-
-# Minimum event duration enforced in the payload (API rejects started_at == ended_at).
-_MIN_EVENT_SECS    = 1    # seconds
-
-
-class _PlateTracker:
-    """
-    Tracks vehicles by YOLO track_id — not by plate string.
-
-    Visit lifecycle
-    ───────────────
-    ENTER  : YOLO assigns a new track_id → record started_at
-    UPDATE : same track_id seen again → update last_seen, accumulate OCR reading
-    EXIT   : track_id absent for _PRESENCE_GRACE seconds → pick best plate from
-             all accumulated readings, post ONE event
-
-    Using track_id (instead of plate string) means OCR noise across frames
-    (e.g. "FV646PR" vs "FV66PR") no longer creates duplicate events — they
-    are all collected as readings for the same physical vehicle visit.
-    The best plate is chosen by frequency first, then confidence.
-    """
-
-    def __init__(self):
-        # track_id (int) → visit dict
-        self._active: dict = {}
-
-    def update(
-        self,
-        track_id:     int,
-        vehicle_type: str,
-        plate:        str   = None,
-        ocr_conf:     float = 0.0,
-    ) -> bool:
-        """
-        Record a frame for this track. Returns True if it is a brand-new visit.
-        plate may be None when YOLO sees the vehicle but OCR hasn't read yet.
-        """
-        now_ts  = time.time()
-        now_iso = _utc_now()
-
-        if track_id not in self._active:
-            self._active[track_id] = {
-                "started_ts":    now_ts,
-                "started_iso":   now_iso,
-                "last_seen_ts":  now_ts,
-                "last_seen_iso": now_iso,
-                "vehicle_type":  vehicle_type,
-                "readings":      [],   # [(plate_str, ocr_conf), ...]
-            }
-            is_new = True
-        else:
-            v = self._active[track_id]
-            v["last_seen_ts"]  = now_ts
-            v["last_seen_iso"] = now_iso
-            is_new = False
-
-        if plate:
-            self._active[track_id]["readings"].append((plate, ocr_conf))
-
-        return is_new
-
-    def collect_completed(self, grace: float = _PRESENCE_GRACE) -> list:
-        """
-        Return finalised events for tracks absent for at least `grace` seconds.
-        Tracks with zero plate readings are silently discarded (car never identified).
-        """
-        now_ts    = time.time()
-        completed = []
-        for tid, v in list(self._active.items()):
-            if now_ts - v["last_seen_ts"] >= grace:
-                evt = _PlateTracker._make_event(tid, v)
-                if evt:
-                    completed.append(evt)
-                else:
-                    log.debug(f"Track #{tid}: no plate readings — skipping event")
-                del self._active[tid]
-        return completed
-
-    def flush(self) -> list:
-        """Force-complete all active visits (shutdown)."""
-        completed = [e for e in
-                     (_PlateTracker._make_event(t, v) for t, v in self._active.items())
-                     if e]
-        self._active.clear()
-        return completed
-
-    @staticmethod
-    def _best_plate(readings: list) -> tuple:
-        """
-        Given [(plate, conf), …] return (best_plate_str, best_conf).
-
-        Strategy: prefer the plate string that appears most often across frames
-        (handles OCR noise). Break ties by highest confidence.
-        """
-        from collections import Counter
-        if not readings:
-            return None, 0.0
-
-        freq      = Counter(p for p, _ in readings)
-        max_freq  = freq.most_common(1)[0][1]
-        # Candidates: all plates tied for highest frequency
-        top       = {p for p, f in freq.items() if f == max_freq}
-        # Among those, pick the one with the highest single-reading confidence
-        best_plate, best_conf = max(
-            ((p, c) for p, c in readings if p in top),
-            key=lambda x: x[1],
-        )
-        return best_plate, best_conf
-
-    @staticmethod
-    def _make_event(track_id: int, v: dict):
-        plate, ocr_conf = _PlateTracker._best_plate(v["readings"])
-        if not plate:
-            return None   # never got a valid plate read
-
-        started_ts  = v["started_ts"]
-        started_iso = v["started_iso"]
-        last_ts     = v["last_seen_ts"]
-        last_iso    = v["last_seen_iso"]
-
-        # API requires ended_at strictly after started_at
-        if last_ts < started_ts + _MIN_EVENT_SECS:
-            ended_iso = _utc_from_ts(started_ts + _MIN_EVENT_SECS)
-        else:
-            ended_iso = last_iso
-
-        return {
-            "plate":        plate,
-            "vehicle_type": v["vehicle_type"],
-            "started_at":   started_iso,
-            "ended_at":     ended_iso,
-            "ocr_conf":     ocr_conf,
-            "track_id":     track_id,
-            "reading_count": len(v["readings"]),
-            "all_readings": v["readings"],   # for debug logging
-        }
-
-
-def _post_event_and_queue(evt: dict, lav_id: int, dev_id, stats: dict) -> None:
-    """Post a completed visit event; fall back to the offline queue on network failure."""
-    plate      = evt["plate"]
-    n_readings = evt.get("reading_count", "?")
-    ocr_conf   = evt.get("ocr_conf", 0.0)
-    confidence_pct = round(ocr_conf * 100, 2)  # backend stores 0–100, detector tracks 0–1
-    log.info(
-        f"📋  Posting event: {plate}  "
-        f"{evt['started_at']}  →  {evt['ended_at']}  "
-        f"(track #{evt.get('track_id','?')}  {n_readings} readings  ocr={ocr_conf:.0%})"
-    )
-    result = api.post_event(
-        lavvaggio_id=lav_id,
-        plate=plate,
-        vehicle_type=evt["vehicle_type"],
-        started_at=evt["started_at"],
-        ended_at=evt["ended_at"],
-        device_id=dev_id,
-        confidence=confidence_pct,
-    )
-    if result is True:
-        stats["sent"] += 1
-    elif result is api._PERMANENT_FAILURE:
-        # Payload was permanently rejected (422/401) — no point queuing it
-        log.warning(f"⚠️  Event for {plate} permanently rejected — not queued")
-    else:
-        # Network/temporary failure — queue for later retry
-        stats["queued"] += 1
-        db.enqueue(
-            lavvaggio_id=lav_id,
-            plate=plate,
-            vehicle_type=evt["vehicle_type"],
-            started_at=evt["started_at"],
-            ended_at=evt["ended_at"],
-            device_id=dev_id,
-            confidence=confidence_pct,
-        )
-        log.info(f"📥 Queued offline → {plate}")
-
-
-def _args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--setup",  action="store_true")
-    p.add_argument("--status", action="store_true")
-    p.add_argument("--reset",       action="store_true")
-    p.add_argument("--clear-queue", action="store_true",
-                   help="Delete all queued events and exit")
-    p.add_argument("--debug",  action="store_true")
-    p.add_argument("--test",   action="store_true",
-                   help="Test mode: live preview window, no API posting")
-    p.add_argument("--post",   action="store_true",
-                   help="Also post detected plates to the API (use with --test)")
-    p.add_argument("--source", default=None,
-                   help="Video file or camera index for --test (default: configured camera)")
-    return p.parse_args()
-
-
+log = logging.getLogger("laventra")
 _shutdown = False
+_exit_code = 0
 
 
 def _on_signal(sig, frame):
@@ -254,598 +52,510 @@ def _on_signal(sig, frame):
     _shutdown = True
 
 
-def _print_status() -> None:
-    s = db.session_summary()
-    q = db.queue_count()
-    print()
-    print("─" * 52)
-    print("  LAVENTRA DETECTOR — STATUS")
-    print("─" * 52)
-    print(f"  API URL    : {s['api_url']}")
-    print(f"  Email      : {s['email']}")
-    print(f"  Lavvaggio  : {s['lavvaggio_name']} (id={s['lavvaggio_id']})")
-    print(f"  Device     : {s['device_id'] or '—'}")
-    print(f"  Camera     : {s['camera_url']}")
-    print(f"  Token      : {'✅ set' if s['token_set'] == 'yes' else '❌ missing'}")
-    print(f"  Queue      : {q} event(s) pending")
-    print(f"  Ready      : {'✅ yes' if db.has_session() else '❌ run: python main.py'}")
-    print("─" * 52)
-    print()
-
-
-def _run_setup() -> bool:
-    print()
-    print("═" * 52)
-    print("  LAVENTRA DETECTOR — Setup")
-    print("═" * 52)
-    print("  Saved locally — only needed once.")
-    print()
-
-    if not auth.interactive_login():
-        log.error("Setup cancelled — sign in failed")
+def _detect_gpu() -> bool:
+    """Return True if a CUDA-capable GPU is available."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
         return False
 
-    if not lav_module.interactive_select():
-        log.error("Setup cancelled — no lavvaggio selected")
-        return False
 
-    # ── Provision a persistent device token ──
-    # After this point the detector runs against the API with the device token,
-    # not the user JWT — so the user's password can change without breaking it.
-    lav_id, lav_name, _prev_dev_id = lav_module.load_from_db()
-    log.info("Provisioning device API token…")
-    result = auth.device_setup(
-        lavvaggio_id=lav_id,
-        serial_number=db.session_get("device_serial", None),
-    )
-    if not result.get("ok"):
-        log.error(f"Device setup failed ({result.get('reason','unknown')}) — cannot continue")
-        return False
-
-    db.session_set("device_id",    result["device_id"])
-    db.session_set("device_token", result["api_token"])
-    if result.get("serial_number"):
-        db.session_set("device_serial", result["serial_number"])
-
-    # Clear the user password — the device token is what we use from now on
-    db.session_set("password", "")
-    # Also switch the shared HTTP session to the device token
-    auth.apply_device_token()
-    log.info(f"✅ Device token provisioned (device_id={result['device_id']})")
-
-    cam_module.setup_camera_url()
-
-    print()
-    print("═" * 52)
-    print("  ✅  Setup complete!")
-    print("═" * 52)
-    print(f"  Lavvaggio : {lav_name} (id={lav_id})")
-    print(f"  Device    : {result['device_id']}")
-    print(f"  Camera    : {db.session_get('camera_url', '—')}")
-    print(f"  API       : {db.session_get('api_url')}")
-    print()
-    return True
+def _on_license_revoked():
+    """Called by HeartbeatThread / LicenseRefresher when backend revokes us."""
+    global _shutdown, _exit_code
+    log.error("❌ License revoked by backend — shutting down.")
+    log.error("   Run: python main.py --activate <new-code>")
+    _exit_code = 2
+    _shutdown = True
 
 
-def _interactive_reconnect() -> bool:
-    """
-    Called on startup when saved config exists but API is unreachable/unauthorized.
-    Returns True if connected, False to proceed in offline mode.
-    """
-    print()
-    print("─" * 52)
-    print("  ⚠️  Cannot connect to Laventra API")
-    print("─" * 52)
-    s = db.session_summary()
-    print(f"  URL   : {s['api_url']}")
-    print(f"  Email : {s['email']}")
-    print()
-    print("  1 — API URL is wrong  (enter a new URL)")
-    print("  2 — Credentials wrong (sign in again)")
-    print("  3 — Continue offline  (queue events)")
-    print()
+# ─── CLI ───────────────────────────────────────────────────────────────────
+def _args():
+    p = argparse.ArgumentParser(prog="laventra-detector")
+    p.add_argument("--activate", metavar="CODE",
+                   help="Exchange an activation code for a license and exit")
+    p.add_argument("--api-url", metavar="URL",
+                   help="Backend API URL (used with --activate; saved for later)")
+    p.add_argument("--select-camera", action="store_true",
+                   help="Pick which camera to stream and exit")
+    p.add_argument("--deactivate", action="store_true",
+                   help="Clear local license + queue and exit")
+    p.add_argument("--status", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--test", action="store_true",
+                   help="Test mode: live preview window, no API posting")
+    p.add_argument("--source", default=None,
+                   help="Video file or camera index for --test "
+                        "(default: selected camera)")
+    p.add_argument("--clear-queue", action="store_true")
+    p.add_argument("--show-deadletter", action="store_true")
+    p.add_argument("--add-camera", metavar="URL",
+                   help="Register a camera locally without backend round-trip "
+                        "(useful for offline testing). Use with --camera-name and "
+                        "optionally --camera-id.")
+    p.add_argument("--camera-name", metavar="NAME", default=None)
+    p.add_argument("--camera-id",   metavar="ID",   type=int, default=None)
+    return p.parse_args()
 
-    while True:
-        try:
-            choice = input("  Choice [3]: ").strip() or "3"
-        except (EOFError, KeyboardInterrupt):
-            return False
 
-        if choice == "1":
-            if auth.prompt_new_api_url():
-                log.info("✅ Reconnected successfully")
-                return True
-            # Prompt again
-            print()
+# ─── Sub-commands ──────────────────────────────────────────────────────────
+def _cmd_activate(args) -> int:
+    if not args.api_url:
+        api_url = db.kv_get("api_url", "")
+        if not api_url:
             try:
-                again = input("  Still offline. Try another option? (y/n) [y]: ").strip().lower()
+                api_url = input("  Backend API URL: ").strip()
             except (EOFError, KeyboardInterrupt):
-                return False
-            if again == "n":
-                return False
-            print()
-            print("  1 — API URL is wrong  (enter a new URL)")
-            print("  2 — Credentials wrong (sign in again)")
-            print("  3 — Continue offline  (queue events)")
-            print()
-            continue
+                return 1
+    else:
+        api_url = args.api_url
+    if not api_url:
+        log.error("No --api-url and none stored — cannot activate")
+        return 1
 
-        if choice == "2":
-            if auth.interactive_relogin():
-                log.info("✅ Reconnected successfully")
-                return True
-            print()
-            try:
-                again = input("  Still offline. Try another option? (y/n) [y]: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                return False
-            if again == "n":
-                return False
-            print()
-            print("  1 — API URL is wrong  (enter a new URL)")
-            print("  2 — Credentials wrong (sign in again)")
-            print("  3 — Continue offline  (queue events)")
-            print()
-            continue
+    log.info(f"Activating against {api_url}…")
+    try:
+        claims = license_module.activate(api_url=api_url,
+                                         activation_code=args.activate)
+    except license_module.ActivationError as e:
+        log.error(f"❌ Activation failed: {e}")
+        return 1
+    except license_module.LicenseInvalid as e:
+        log.error(f"❌ License invalid: {e}")
+        return 1
 
-        # choice == "3" or anything else
-        log.info("Continuing in offline mode — events will be queued")
-        return False
+    print()
+    print("─" * 52)
+    print(f"  ✅ Activated as device #{claims.get('sub')}")
+    print(f"     Lavvaggio #{claims.get('lavvaggio_id')}")
+    print(f"     Expires   {license_module._ts_to_iso(claims.get('exp'))}")
+    print("─" * 52)
+    print()
+
+    log.info("Fetching cameras…")
+    try:
+        cameras_module.fetch_remote()
+    except cameras_module.CameraFetchError as e:
+        log.warning(f"Could not fetch cameras now: {e}")
+        log.info("Run `python main.py --select-camera` once the backend is reachable.")
+        return 0
+
+    cam = cameras_module.interactive_select()
+    if not cam:
+        log.info("No camera selected — run `python main.py --select-camera` later.")
+    return 0
 
 
-def _run_test(source=None, post=False) -> None:
+def _cmd_add_camera(args) -> int:
+    """Register a camera locally — no backend call. For testing + offline provisioning."""
+    if not args.add_camera:
+        return 1
+    # Assign next-available id if not provided
+    cam_id = args.camera_id
+    if cam_id is None:
+        existing = [c["id"] for c in db.cameras_list()]
+        cam_id = (max(existing) + 1) if existing else 1
+    name = args.camera_name or f"Camera {cam_id}"
+
+    # Merge with any existing cameras so this acts as an additive registration.
+    existing = db.cameras_list()
+    by_id = {c["id"]: c for c in existing}
+    by_id[cam_id] = {
+        "id":         cam_id,
+        "name":       name,
+        "stream_url": args.add_camera,
+        "kind":       _guess_kind(args.add_camera),
+    }
+    db.cameras_replace(list(by_id.values()))
+    db.kv_set("camera_id", cam_id)
+    db.kv_set("camera_url", args.add_camera)
+    print()
+    print(f"  ✅ Added camera #{cam_id} — {name}")
+    print(f"     URL: {args.add_camera}")
+    print(f"     Selected as active camera.")
+    print()
+    return 0
+
+
+def _guess_kind(url: str) -> str:
+    u = url.lower()
+    if u.startswith("rtsp://"):
+        return "rtsp"
+    if u.startswith("http"):
+        return "mjpeg"
+    return "webcam"
+
+
+def _cmd_select_camera() -> int:
+    if not db.has_license():
+        log.error("No license — run: python main.py --activate CODE")
+        return 1
+    cam = cameras_module.interactive_select()
+    return 0 if cam else 1
+
+
+def _cmd_deactivate() -> int:
+    try:
+        confirm = input("⚠️  Clear license, cameras and offline queue? Type YES: ")
+    except (EOFError, KeyboardInterrupt):
+        return 0
+    if confirm.strip() != "YES":
+        log.info("Cancelled")
+        return 0
+    db.license_clear()
+    db.cameras_replace([])
+    n = db.queue_clear()
+    db.kv_delete("camera_id")
+    db.kv_delete("camera_url")
+    log.info(f"✅ Cleared license, cameras, and {n} queued event(s)")
+    return 0
+
+
+def _cmd_status() -> int:
+    s = db.status_summary()
+    print()
+    print("─" * 52)
+    print(f"  LAVENTRA DETECTOR  v{config.VERSION}")
+    print("─" * 52)
+    print(f"  API URL         : {s['api_url']}")
+    print(f"  License         : {'✅ ' if s['license_set']=='yes' else '❌ '}{s['license_set']}"
+          f"  ({'REVOKED' if s['license_revoked']=='yes' else 'ok'})")
+    print(f"  License expires : {s['license_expires']}")
+    print(f"  License ID      : {s['license_id']}")
+    print(f"  Device ID       : {s['device_id']}")
+    print(f"  Lavvaggio       : {s['lavvaggio_id']}")
+    cam = cameras_module.selected()
+    if cam:
+        print(f"  Camera          : #{cam['id']} {cam['name']} → {cam['stream_url']}")
+    else:
+        print(f"  Camera          : — (run --select-camera)")
+    print(f"  Offline queue   : {s['queue']} pending")
+    print(f"  Dead-letter     : {s['dead_letter']}")
+    print(f"  Ready           : {'✅ yes' if db.has_license() and cam else '❌ no'}")
+    print("─" * 52)
+    print()
+    return 0
+
+
+def _cmd_show_deadletter() -> int:
+    rows = db.dead_letter_list()
+    if not rows:
+        print("  Dead-letter is empty.")
+        return 0
+    print()
+    print(f"  {len(rows)} dead-lettered event(s):")
+    print("─" * 80)
+    for r in rows:
+        print(f"  [{r['created_at']}] HTTP {r['error_code']}  "
+              f"plate={r['plate']} started={r['started_at']}")
+        if r["error_body"]:
+            print(f"      body: {r['error_body'][:160]}")
+    print("─" * 80)
+    return 0
+
+
+# ─── Test mode (file or camera, no API) ────────────────────────────────────
+def _cmd_test(source=None) -> int:
     import os
-
-    # Resolve source: explicit arg > configured camera > webcam 0
     if source is None:
-        source = db.session_get("camera_url", "0")
+        cam = cameras_module.selected()
+        source = cam["stream_url"] if cam else "0"
     src = int(source) if str(source).strip().isdigit() else source
     is_file = isinstance(src, str) and os.path.isfile(src)
 
-    # When --post is requested, load lavvaggio/device and verify API connection
-    lav_id = lav_name = dev_id = None
-    if post:
-        lav_id, lav_name, dev_id = lav_module.load_from_db()
-        if not lav_id:
-            log.error("No lavvaggio set — run: python main.py --setup")
-            sys.exit(1)
-        auth.load_saved_token()
-        log.info("Verifying API session…")
-        result = auth.verify_connection()
-        if not result["ok"]:
-            log.error("Cannot connect to the API — run without --post or fix setup")
-            sys.exit(1)
-        log.info("✅ API session verified")
-
     print()
     print("═" * 52)
-    print("  LAVENTRA DETECTOR — Test Mode")
+    print("  LAVENTRA — Test Mode")
     print("═" * 52)
-    print(f"  Source  : {source}")
-    print(f"  Type    : {'video file' if is_file else 'camera feed'}")
-    if post:
-        print(f"  API     : enabled — posting events")
-        print(f"  Lavvaggio : {lav_name} (id={lav_id})")
-        print(f"  Device    : {dev_id or '—'}")
-    else:
-        print(f"  API     : disabled (test only)")
+    print(f"  Source : {source}")
+    print(f"  Type   : {'video file' if is_file else 'camera feed'}")
+    print("  Press Q to quit")
     print("═" * 52)
-    print()
-    print("  Press Q or Ctrl+C to quit")
     print()
 
-    # yolov8s.pt is more accurate than yolov8n.pt — download it once with:
-    #   python -c "from ultralytics import YOLO; YOLO('yolov8s.pt')"
     log.info("Loading AI models…")
-    detector = det_module.PlateDetector(
-        yolo_model   = "yolov8s.pt" if __import__("os").path.exists("yolov8s.pt") else "yolov8n.pt",
-        yolo_conf    = 0.25,          # low threshold — catch everything in test
-        ocr_min_conf = 0.40,          # lower OCR bar so partial reads show
-        cooldown_sec = 30 if (post and is_file) else (0 if is_file else 3),
-        use_gpu      = False,
+    use_gpu = _detect_gpu()
+    if use_gpu:
+        log.info("✅ CUDA detected — using GPU")
+    detector = detector_module.PlateDetector(
+        vehicle_conf=0.25,
+        plate_conf=0.20,
+        ocr_min_conf=0.40,
+        cooldown_sec=0 if is_file else config.OCR_COOLDOWN_S,
+        use_gpu=use_gpu,
     )
     if not detector.ready:
-        log.error("AI models failed to load — pip install ultralytics easyocr")
-        sys.exit(1)
+        log.error("AI models failed to load — pip install -r requirements.txt")
+        return 1
 
-    # CAP_AVFOUNDATION only works for local device indices on macOS.
-    # HTTP streams (DroidCam, IP Webcam) use _MJPEGCapture which is reliable.
-    if is_file:
-        cap = cv2.VideoCapture(src)
-    else:
-        cap = cam_module._open_cap(src)
-
+    cap = cv2.VideoCapture(src) if is_file else camera_module._open_capture(src)
     if not cap.isOpened():
         log.error(f"Cannot open source: {source}")
-        sys.exit(1)
-
-    fps_src      = cap.get(cv2.CAP_PROP_FPS) or 25
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    delay_ms     = max(1, int(1000 / fps_src)) if is_file else 1
-
-    if is_file:
-        duration = int(total_frames / fps_src) if fps_src else 0
-        log.info(f"  Video : {total_frames} frames  {fps_src:.0f}fps  ~{duration}s")
-        log.info(f"  Size  : {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-    log.info("✅ Source opened — press Q in the preview window to quit")
-    log.info("─" * 52)
-
-    # Target display width — keeps the window small and imshow fast
-    DISPLAY_W = 480
-    frame_interval = 1.0 / fps_src   # seconds per frame
-
-    # ── Detection runs in a background thread so it never blocks the display ──
-    # frame_q : main thread drops the latest frame here (size=1, always fresh)
-    # result_q: detection thread posts results here (size=1, main reads latest)
-    frame_q  = _queue.Queue(maxsize=1)
-    result_q = _queue.Queue(maxsize=1)
-    det_stop  = threading.Event()
-
-    def _detect_worker():
-        while not det_stop.is_set():
-            try:
-                frm = frame_q.get(timeout=0.3)
-            except _queue.Empty:
-                continue
-            dets = detector.detect(frm)
-            # replace any unconsumed result with the latest
-            try:
-                result_q.put_nowait(dets)
-            except _queue.Full:
-                try:
-                    result_q.get_nowait()
-                except _queue.Empty:
-                    pass
-                result_q.put_nowait(dets)
-
-    det_thread = threading.Thread(target=_detect_worker, daemon=True, name="detector")
-    det_thread.start()
-
-    seen_plates = {}
-    frame_n     = 0
-    t_start     = time.time()
-    last_dets   = []
-    no_det_ctr  = 0
-    stats       = {"detected": 0, "sent": 0, "queued": 0}
+        return 1
+    fps_src = cap.get(cv2.CAP_PROP_FPS) or 25
+    seen_plates: dict[str, int] = {}
+    t_start = time.time()
+    frame_n = 0
 
     while not _shutdown:
         t_frame = time.time()
-
         ret, frame = cap.read()
         if not ret:
-            if is_file:
-                log.info("End of video.")
-            else:
-                log.warning("Camera read failed — retrying…")
-                time.sleep(0.05)
+            log.info("End of stream.")
             break
-
         frame_n += 1
+        if frame_n % 3 != 0:
+            continue
+        dets = detector.detect(frame)
+        for det in dets:
+            if det.get("plate"):
+                p = det["plate"]
+                seen_plates[p] = seen_plates.get(p, 0) + 1
+                log.info(f"🚗  #{det['track_id']}  {p:<12}  type={det['type']:<10} "
+                         f"ocr={det['ocr_conf']:.0%}  (seen {seen_plates[p]}×)")
 
-        # Feed latest frame to detector — drop if busy (never block display)
-        try:
-            frame_q.put_nowait(frame.copy())
-        except _queue.Full:
-            pass
-
-        # Pick up latest detection result (non-blocking)
-        try:
-            dets = result_q.get_nowait()
-            if dets:
-                no_det_ctr = 0
-                last_dets  = dets
-                for det in dets:
-                    plate    = det["plate"]     # may be None while reading
-                    vtype    = det["type"]
-                    track_id = det["track_id"]
-                    # mark_seen is now handled inside detector; skip external call
-                    if plate:
-                        seen_plates[plate] = seen_plates.get(plate, 0) + 1
-                        log.info(
-                            f"🚗  #{track_id}  {plate:<12}  type={vtype:<10}  "
-                            f"yolo={det['yolo_conf']:.0%}  ocr={det['ocr_conf']:.0%}  "
-                            f"(seen {seen_plates[plate]}x)"
-                        )
-                        if post:
-                            now_ts2     = time.time()
-                            started_iso = _utc_now()
-                            ended_iso   = _utc_from_ts(now_ts2 + 1)
-                            stats["detected"] += 1
-                            result = api.post_event(
-                                lavvaggio_id=lav_id,
-                                plate=plate,
-                                vehicle_type=vtype,
-                                started_at=started_iso,
-                                ended_at=ended_iso,
-                                device_id=dev_id,
-                                confidence=round(det["ocr_conf"] * 100, 2),
-                            )
-                            if result is True:
-                                stats["sent"] += 1
-                                log.info(f"  ✅ Event posted: {plate}")
-                            elif result is not api._PERMANENT_FAILURE:
-                                stats["queued"] += 1
-                                db.enqueue(
-                                    lavvaggio_id=lav_id,
-                                    plate=plate,
-                                    vehicle_type=vtype,
-                                    started_at=started_iso,
-                                    ended_at=ended_iso,
-                                    device_id=dev_id,
-                                )
-                                log.warning(f"  ⚠️  Event queued (API failed): {plate}")
-            else:
-                no_det_ctr += 1
-                if no_det_ctr > 20:
-                    last_dets = []
-        except _queue.Empty:
-            pass
-
-        # Resize for display — imshow on large frames (888x1920) is very slow
         h_f, w_f = frame.shape[:2]
-        dh = int(h_f * DISPLAY_W / w_f)
-        vis = cv2.resize(detector.draw(frame, last_dets), (DISPLAY_W, dh))
-
-        elapsed = int(time.time() - t_start)
-        if is_file and total_frames:
-            pct = int(frame_n / total_frames * 100)
-            hud = f"  {pct}%  |  {len(seen_plates)} plate(s)  |  Q=quit  "
-        else:
-            hud = f"  {elapsed}s  |  {len(seen_plates)} plate(s)  |  Q=quit  "
-
-        (hw, hh), _ = cv2.getTextSize(hud, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(vis, (0, 0), (hw + 8, hh + 8), (30, 30, 30), -1)
-        cv2.putText(vis, hud, (4, hh + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
+        vis = cv2.resize(detector.draw(frame, dets),
+                         (480, int(h_f * 480 / w_f)))
         cv2.imshow("Laventra — Test Mode", vis)
-        if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
+        if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
             break
-
-        # Wall-clock pacing — sleep the remaining time in this frame slot
         if is_file:
             used = time.time() - t_frame
-            remaining = frame_interval - used
-            if remaining > 0:
-                time.sleep(remaining)
+            sleep = (1.0 / fps_src) - used
+            if sleep > 0:
+                time.sleep(sleep)
 
-    det_stop.set()
-    det_thread.join(timeout=3)
     cap.release()
     cv2.destroyAllWindows()
-
     elapsed = int(time.time() - t_start)
     print()
     print("─" * 52)
-    log.info(f"Test complete — {frame_n} frames  |  {elapsed}s  |  {len(seen_plates)} unique plate(s)")
-    if seen_plates:
-        log.info("Plates detected:")
-        for plate, count in sorted(seen_plates.items(), key=lambda x: -x[1]):
-            log.info(f"  {plate:<14}  ×{count}")
-    else:
-        log.info("No plates detected")
-    if post:
-        log.info(
-            f"Events — detected={stats['detected']}  "
-            f"sent={stats['sent']}  "
-            f"queued={stats['queued']}"
-        )
+    log.info(f"Test done — {frame_n} frames  {elapsed}s  {len(seen_plates)} unique plate(s)")
+    for plate, count in sorted(seen_plates.items(), key=lambda x: -x[1]):
+        log.info(f"  {plate:<14}  ×{count}")
     print("─" * 52)
+    return 0
 
 
-def _run_detector() -> None:
-    lav_id, lav_name, _ = lav_module.load_from_db()
-    cam_url             = db.session_get("camera_url", "0")
-    device_id_raw       = db.session_get("device_id", "")
-    dev_id              = int(device_id_raw) if device_id_raw and str(device_id_raw).isdigit() else None
-    device_token        = db.session_get("device_token", "")
+# ─── Main runtime ──────────────────────────────────────────────────────────
+def _run_detector() -> int:
+    global _exit_code
 
-    if not lav_id:
-        log.error("No lavvaggio set — run: python main.py --setup")
-        sys.exit(1)
+    # 1) License check
+    try:
+        claims = license_module.ensure_valid()
+    except license_module.LicenseRevoked as e:
+        log.error(f"❌ {e}")
+        log.error("   Run: python main.py --activate <new-code>")
+        return 2
+    except license_module.LicenseError as e:
+        log.error(f"❌ {e}")
+        return 1
 
-    if not device_token:
-        log.error("No device token — your session predates this detector version.")
-        log.error("  → Please re-run: python main.py --setup")
-        sys.exit(1)
-
-    print()
-    print("═" * 52)
-    print("  LAVENTRA DETECTOR — Running")
-    print("═" * 52)
-    print(f"  Lavvaggio : {lav_name} (id={lav_id})")
-    print(f"  Device    : {dev_id or '—'}")
-    print(f"  Camera    : {cam_url}")
-    print(f"  API       : {db.session_get('api_url')}")
-    print(f"  Queue     : {db.queue_count()} pending")
-    print("═" * 52)
-    print()
-
-    # Attach the persistent device token to the shared HTTP session.
-    # No user JWT, no re-login. Password changes never affect the detector.
-    auth.apply_device_token()
-
-    log.info("Verifying API session…")
-    result = auth.verify_connection()
-    if not result["ok"]:
-        reason = result.get("reason", "unknown")
-        if reason == "url":
-            log.warning("API unreachable at startup — continuing; events will queue")
-        elif reason == "auth":
-            log.error("Device token rejected — re-run: python main.py --setup")
-            sys.exit(1)
+    # 2) Camera selection
+    cam = cameras_module.selected()
+    if not cam:
+        log.warning("No camera selected — refreshing list from backend…")
+        try:
+            cameras_module.fetch_remote()
+        except cameras_module.CameraFetchError as e:
+            log.error(f"Could not fetch cameras: {e}")
+            log.error("  → Run: python main.py --select-camera")
+            return 1
+        cams = cameras_module.local_list()
+        if len(cams) == 1:
+            cam = cameras_module.select(cams[0]["id"])
         else:
-            log.warning(f"API check returned {reason} — continuing in degraded mode")
-    else:
-        log.info("✅ API session verified (device token)")
+            log.error("Run: python main.py --select-camera")
+            return 1
+
+    cam_url = cam["stream_url"]
+    cam_id = cam["id"]
+
+    print()
+    print("═" * 52)
+    print(f"  LAVENTRA DETECTOR  v{config.VERSION}  — Running")
+    print("═" * 52)
+    print(f"  Device     : #{claims.get('sub')}  ({license_module.hostname()})")
+    print(f"  Lavvaggio  : #{claims.get('lavvaggio_id')}")
+    print(f"  Camera     : #{cam_id} {cam['name']} → {cam_url}")
+    print(f"  API        : {db.kv_get('api_url')}")
+    print(f"  Queue      : {db.queue_count()} pending")
+    print("═" * 52)
+    print()
+
+    # 3) Boot AI pipeline
+    log.info("Loading AI models…")
+    use_gpu = _detect_gpu()
+    if use_gpu:
+        log.info("✅ CUDA detected — using GPU")
+    detector = detector_module.PlateDetector(use_gpu=use_gpu)
+    if not detector.ready:
+        log.error("AI models failed to load — pip install -r requirements.txt")
+        return 1
+
+    cam_stream = camera_module.CameraStream(cam_url)
+    cam_stream.start()
+
+    dispatcher = events_module.EventDispatcher()
+    dispatcher.start()
 
     flusher = api.QueueFlusher()
     flusher.start()
 
-    log.info("Loading AI models…")
-    detector = det_module.PlateDetector(
-        yolo_model   = "yolov8n.pt",
-        yolo_conf    = 0.40,
-        ocr_min_conf = 0.55,
-        cooldown_sec = _PRESENCE_COOLDOWN,
-        use_gpu      = False,
-    )
-    if not detector.ready:
-        log.error("AI models failed to load")
-        log.error("  → pip install ultralytics easyocr")
-        sys.exit(1)
-
-    camera = cam_module.CameraStream(cam_url)
-    camera.start()
-
-    # Start heartbeat thread — tells the backend "I'm alive" every 60s.
-    # Also reports camera connectivity so the backend can track it independently.
     heartbeat = api.HeartbeatThread(
-        device_id=dev_id,
-        device_token=device_token,
-        camera_status_fn=lambda: camera.connected,
+        camera_status_fn=lambda: cam_stream.connected,
+        camera_id=cam_id,
+        on_revoked=_on_license_revoked,
     )
     heartbeat.start()
 
-    log.info("✅ Detector running — press Ctrl+C to stop")
-    log.info(f"   Plate tracking: cooldown={_PRESENCE_COOLDOWN}s  grace={_PRESENCE_GRACE}s")
+    refresher = license_module.LicenseRefresher(on_revoked=_on_license_revoked)
+    refresher.start()
+
+    log.info("✅ Detector running — Ctrl+C to stop")
+    log.info(f"   Visit grace = {config.PRESENCE_GRACE_S}s  "
+             f"(one event per vehicle per wash visit)")
     log.info("─" * 52)
 
-    tracker    = _PlateTracker()
-    stats      = {"detected": 0, "sent": 0, "queued": 0}
-    last_stats = time.time()
-    frame_n    = 0
+    visit_tracker = tracker_module.VisitTracker()
+    last_stats_ts = time.time()
+    last_visit_check_ts = 0.0
 
     while not _shutdown:
         try:
-            frame = camera.read()
+            frame = cam_stream.read()
             if frame is None:
-                # Camera not ready — still check for visits that have ended
-                for evt in tracker.collect_completed():
-                    _post_event_and_queue(evt, lav_id, dev_id, stats)
+                # Even without a frame, finalise visits whose grace expired.
+                if time.time() - last_visit_check_ts >= 1.0:
+                    for evt in visit_tracker.collect_completed():
+                        evt["camera_id"] = cam_id
+                        dispatcher.submit(evt)
+                    last_visit_check_ts = time.time()
                 time.sleep(0.05)
                 continue
 
-            frame_n += 1
-            if frame_n % 3 != 0:
-                continue
-
             detections = detector.detect(frame)
-
             for det in detections:
-                track_id = det["track_id"]
-                vtype    = det["type"]
-                plate    = det["plate"]    # None when OCR not yet read
-                ocr_conf = det["ocr_conf"]
-
-                # mark_seen() is now called inside detector._detect_inner()
-                # when OCR succeeds — no external call needed here.
-
-                is_new = tracker.update(track_id, vtype, plate, ocr_conf)
-
-                if plate:
-                    stats["detected"] += 1
-                    log.info(
-                        f"🚗  #{track_id}  {plate:<12}  type={vtype:<12}  "
-                        f"yolo={det['yolo_conf']:.0%}  ocr={ocr_conf:.0%}"
-                        + ("  [arrived]" if is_new else "")
-                    )
-                elif is_new:
-                    log.info(
-                        f"🚗  #{track_id}  (reading plate…)  type={vtype:<12}  "
-                        f"yolo={det['yolo_conf']:.0%}  [arrived]"
-                    )
-
-            # Post events for cars that have been absent for _PRESENCE_GRACE seconds
-            for evt in tracker.collect_completed():
-                _post_event_and_queue(evt, lav_id, dev_id, stats)
-
-            if time.time() - last_stats >= 60:
-                active  = len(tracker._active)
-                cam_ok  = "✅" if camera.connected else "❌ reconnecting"
-                log.info(
-                    f"📊  detected={stats['detected']}  "
-                    f"sent={stats['sent']}  "
-                    f"queued={stats['queued']}  "
-                    f"pending={db.queue_count()}  "
-                    f"active_visits={active}  "
-                    f"camera={cam_ok}"
+                visit_tracker.update(
+                    det["track_id"], det["type"],
+                    det.get("plate"), det.get("ocr_conf", 0.0),
                 )
-                last_stats = time.time()
+                if det.get("plate"):
+                    log.info(
+                        f"🚗  #{det['track_id']}  {det['plate']:<12}  "
+                        f"type={det['type']:<10}  ocr={det['ocr_conf']:.0%}"
+                    )
 
+            for evt in visit_tracker.collect_completed():
+                evt["camera_id"] = cam_id
+                dispatcher.submit(evt)
+            last_visit_check_ts = time.time()
+
+            if time.time() - last_stats_ts >= 60:
+                s = dispatcher.stats
+                log.info(
+                    f"📊  sent={s['sent']}  queued={s['queued']}  "
+                    f"dead={s['dead_letter']}  "
+                    f"active_visits={visit_tracker.active_count}  "
+                    f"pending={db.queue_count()}  "
+                    f"camera={'✅' if cam_stream.connected else '❌'}"
+                )
+                last_stats_ts = time.time()
         except KeyboardInterrupt:
             break
         except Exception as e:
             log.error(f"Main loop error (continuing): {e}")
             time.sleep(0.1)
 
-    # Finalise any visits still active at shutdown
-    log.info("Finalising active visits before shutdown…")
-    for evt in tracker.flush():
-        _post_event_and_queue(evt, lav_id, dev_id, stats)
+    # Finalise any in-flight visits before we stop accepting frames
+    log.info("Finalising active visits…")
+    for evt in visit_tracker.flush():
+        evt["camera_id"] = cam_id
+        dispatcher.submit(evt)
 
     log.info("Shutting down…")
-    try:
-        camera.stop()
-    except Exception as e:
-        log.error(f"Camera stop error: {e}")
-    try:
-        flusher.stop()
-    except Exception as e:
-        log.error(f"Flusher stop error: {e}")
-    try:
-        heartbeat.stop()
-    except Exception as e:
-        log.error(f"Heartbeat stop error: {e}")
+    for stopper in (cam_stream.stop, dispatcher.stop, flusher.stop,
+                    heartbeat.stop, refresher.stop):
+        try:
+            stopper()
+        except Exception as e:
+            log.error(f"Stopper error: {e}")
 
+    s = dispatcher.stats
     print()
     print("─" * 52)
-    log.info(
-        f"Session — detected={stats['detected']}  "
-        f"sent={stats['sent']}  "
-        f"queued={stats['queued']}"
-    )
+    log.info(f"Session — sent={s['sent']}  queued={s['queued']}  "
+             f"dead-lettered={s['dead_letter']}")
     log.info("Goodbye.")
     print("─" * 52)
+    return _exit_code
 
 
-if __name__ == "__main__":
+# ─── Entrypoint ────────────────────────────────────────────────────────────
+def _force_utf8_stdio() -> None:
+    """Switch stdout/stderr to UTF-8 on Windows where the default is cp1252."""
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is not None:
+            try:
+                reconf(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def main() -> int:
+    _force_utf8_stdio()
     args = _args()
-    log  = log_setup.setup(debug=args.debug)
+    log_setup.setup(debug=args.debug)
     db.init()
 
-    signal.signal(signal.SIGINT,  _on_signal)
-    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _on_signal)
 
-    if args.reset:
-        try:
-            confirm = input("⚠️  Clear all config? Type YES: ")
-        except (EOFError, KeyboardInterrupt):
-            sys.exit(0)
-        if confirm.strip() == "YES":
-            db.session_clear()
-            log.info("✅ Session cleared")
-        else:
-            log.info("Cancelled")
-        sys.exit(0)
-
+    if args.deactivate:
+        return _cmd_deactivate()
     if args.clear_queue:
         n = db.queue_clear()
         print(f"✅ Cleared {n} queued event(s)")
-        sys.exit(0)
-
+        return 0
+    if args.show_deadletter:
+        return _cmd_show_deadletter()
+    if args.add_camera:
+        return _cmd_add_camera(args)
+    if args.activate:
+        if db.has_license():
+            log.warning("⚠️  A license is already installed.")
+            log.warning("   Run: python main.py --deactivate")
+            log.warning("   Then: python main.py --activate <new-code>")
+            return 1
+        return _cmd_activate(args)
+    if args.select_camera:
+        return _cmd_select_camera()
     if args.status:
-        _print_status()
-        sys.exit(0)
-
+        return _cmd_status()
     if args.test:
-        _run_test(source=args.source, post=args.post)
-        sys.exit(0)
+        return _cmd_test(source=args.source)
 
-    if args.setup or not db.has_session():
-        ok = _run_setup()
-        if not ok:
-            sys.exit(1)
-        if args.setup:
-            sys.exit(0)
+    if not db.has_license():
+        log.error("No license installed.")
+        log.error("  → Run: python main.py --activate <code>")
+        log.error("  (Dev mode without backend: use tools/generate_dev_license.py)")
+        return 1
 
-    _run_detector()
+    # Friendly hint when running with a dev-minted license
+    lic = db.license_get() or {}
+    if str(lic.get("license_id", "")).startswith("dev-"):
+        log.info("ℹ️  Running with a DEV license (locally minted, not from backend).")
+        log.info("   To switch to a real backend-issued license:")
+        log.info("     python main.py --deactivate")
+        log.info("     python main.py --activate <code-from-admin>")
+
+    return _run_detector()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,138 +1,200 @@
+"""
+HTTP client for the Rails backend, authorised by the device license JWT.
+
+All calls attach Authorization: Bearer <license_jwt>. There is no relogin,
+no password, no recursion. If the license is revoked the backend returns 401
+and we surface a `LicenseRevoked` upstream — the operator must re-activate.
+"""
+from __future__ import annotations
+
 import logging
 import threading
 import time
+
 import requests
+
+import config
 import db
-import auth
+import license as license_module
 
 log = logging.getLogger("laventra")
 
-MAX_RETRIES    = 10
-RETRY_INTERVAL = 60
-_url_fails     = 0
-URL_FAIL_LIMIT = 3
 
-# Exponential backoff settings for post_event retries
-_BACKOFF_INITIAL = 5
-_BACKOFF_MAX     = 60
-_BACKOFF_RETRIES = 5
+# ─── Errors ─────────────────────────────────────────────────────────────────
+class PermanentFailure(Exception):
+    """Backend rejected the payload with 4xx — retrying will not help.
+
+    Replaces the old `_PERMANENT_FAILURE = "PERMANENT"` string sentinel
+    (audit finding H7). Carries the HTTP status + response body so callers
+    can route to the dead_letter table.
+    """
+    def __init__(self, message: str, *, status: int, body: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.body = body
 
 
+class TransientFailure(Exception):
+    """Backend unreachable / 5xx — caller should queue and retry later."""
+
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
 def _v1() -> str:
-    url = db.session_get("api_url", "").rstrip("/")
+    url = db.kv_get("api_url", "").rstrip("/")
     if url.endswith("/api/v1"):
-        url = url[: -len("/api/v1")]
+        return url
     return f"{url}/api/v1"
 
 
-_PERMANENT_FAILURE = "PERMANENT"  # sentinel returned for unretryable rejections
-
-
-def post_event(
-    lavvaggio_id: int,
-    plate: str,
-    vehicle_type: str,
-    started_at: str,
-    ended_at: str,
-    device_id: int = None,
-    confidence: float = None,
-):
-    global _url_fails
-
-    # The Rails API infers lavvaggio_id and device_id from the authenticated
-    # device token — sending them inside car_wash_event triggers an
-    # "Unpermitted parameters" warning and they are silently stripped.
-    event_body = {
-        "vehicle_plate": plate,
-        "vehicle_type":  vehicle_type,
-        "started_at":    started_at,
-        "ended_at":      ended_at,
+def _headers() -> dict:
+    h = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": config.USER_AGENT,
     }
-    # Confidence is stored as a percentage (0–100). Detector tracks 0–1 floats,
-    # so callers convert before passing in.
-    if confidence is not None:
-        event_body["confidence"] = round(float(confidence), 2)
-    payload = {"car_wash_event": event_body}
+    h.update(license_module.bearer_header())
+    return h
 
-    # Always attach the persistent device token. We never re-login — if the token
-    # is rejected, it means the device was revoked and only --setup can fix it.
-    device_token = db.session_get("device_token", "")
-    headers = {"Authorization": f"Bearer {device_token}"} if device_token else {}
-    session = auth.get_session()
 
-    for attempt in range(1):
-        try:
-            r = session.post(
-                f"{_v1()}/car_wash_events",
-                json=payload,
-                headers=headers,
-                timeout=10,
-            )
-            if r.status_code in (200, 201):
-                _url_fails = 0
-                log.info(f"✅ Event posted → {plate}")
-                return True
-            if r.status_code == 401:
-                log.error("Device token rejected — run: python main.py --setup")
-                return _PERMANENT_FAILURE
-            if r.status_code == 422:
-                log.error(f"Event rejected (422): {r.text[:200]}")
-                return _PERMANENT_FAILURE   # invalid payload — retrying will never help
-            log.error(f"POST failed: HTTP {r.status_code} — {r.text[:150]}")
-            return False
+# ─── Events ─────────────────────────────────────────────────────────────────
+def post_event(payload: dict) -> bool:
+    """
+    POST one car_wash_event. Returns True on success.
 
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-            exc_type = "timeout" if isinstance(exc, requests.exceptions.Timeout) else "unreachable"
-            backoff_delay = _BACKOFF_INITIAL
-            for retry in range(1, _BACKOFF_RETRIES + 1):
-                log.warning(
-                    f"API {exc_type} — {plate} — retrying in {backoff_delay}s "
-                    f"({retry}/{_BACKOFF_RETRIES})"
-                )
-                time.sleep(backoff_delay)
-                try:
-                    r = session.post(
-                        f"{_v1()}/car_wash_events",
-                        json=payload,
-                        headers=headers,
-                        timeout=10,
-                    )
-                    if r.status_code in (200, 201):
-                        _url_fails = 0
-                        log.info(f"✅ Event posted → {plate} (after {retry} retries)")
-                        return True
-                    log.error(f"POST failed on retry: HTTP {r.status_code}")
-                    break
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                    backoff_delay = min(backoff_delay * 2, _BACKOFF_MAX)
-                except Exception as e:
-                    log.error(f"POST retry error ({plate}): {e}")
-                    break
-            _url_fails += 1
-            log.warning(f"API unreachable after retries ({_url_fails}/{URL_FAIL_LIMIT}) — {plate}")
-            if _url_fails >= URL_FAIL_LIMIT:
-                _url_fails = 0
-                auth.prompt_new_api_url()
-            return False
-        except Exception as e:
-            log.error(f"POST error ({plate}): {e}")
-            return False
+    Raises PermanentFailure on 401 / 422 / other 4xx (caller writes dead_letter).
+    Raises TransientFailure on network / 5xx (caller writes queue).
+    """
+    body = {"car_wash_event": _strip_none({
+        "vehicle_plate": payload["plate"],
+        "vehicle_type":  payload.get("vehicle_type"),
+        "started_at":    payload["started_at"],
+        "ended_at":      payload["ended_at"],
+        "confidence":    _round_or_none(payload.get("confidence"), 2),
+        "camera_id":     payload.get("camera_id"),
+    })}
+    url = f"{_v1()}/car_wash_events"
+    try:
+        r = requests.post(url, json=body, headers=_headers(),
+                          timeout=config.API_TIMEOUT_S)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        raise TransientFailure(f"Backend unreachable: {e}") from e
+    except requests.exceptions.RequestException as e:
+        raise TransientFailure(f"Request error: {e}") from e
 
+    if r.status_code in (200, 201):
+        return True
+    if r.status_code == 401:
+        db.license_mark_revoked()
+        raise PermanentFailure(
+            "License rejected by backend",
+            status=401, body=r.text[:400],
+        )
+    if 400 <= r.status_code < 500:
+        raise PermanentFailure(
+            f"Backend rejected event: HTTP {r.status_code}",
+            status=r.status_code, body=r.text[:400],
+        )
+    raise TransientFailure(f"Backend HTTP {r.status_code}: {r.text[:200]}")
+
+
+# ─── Heartbeat ──────────────────────────────────────────────────────────────
+def send_heartbeat(*, camera_id=None, camera_online: bool = None,
+                   queue_depth: int = None) -> bool:
+    body = _strip_none({
+        "version":       config.VERSION,
+        "camera_id":     camera_id,
+        "camera_online": camera_online,
+        "queue_depth":   queue_depth,
+    })
+    try:
+        r = requests.post(
+            f"{_v1()}/devices/heartbeat",
+            json=body if body else None,
+            headers=_headers(),
+            timeout=config.API_TIMEOUT_S,
+        )
+    except requests.exceptions.RequestException as e:
+        log.debug(f"heartbeat: {e}")
+        return False
+
+    if r.status_code == 200:
+        return True
+    if r.status_code == 401:
+        # License revoked — escalate (audit H5)
+        db.license_mark_revoked()
+        log.error("❌ Heartbeat: license rejected — backend revoked this device")
+        return False
+    log.warning(f"heartbeat failed: HTTP {r.status_code} — {r.text[:120]}")
     return False
 
 
-class QueueFlusher:
-    def __init__(self):
-        self._stop   = threading.Event()
+class HeartbeatThread:
+    """
+    Periodic heartbeat. On 401 (license revoked) fires `on_revoked` once and exits.
+    """
+
+    def __init__(self, *, camera_status_fn=None, camera_id=None, on_revoked=None):
+        self._cam_status = camera_status_fn or (lambda: True)
+        self._camera_id = camera_id
+        self._on_revoked = on_revoked
+        self._stop = threading.Event()
         self._thread = None
 
     def start(self) -> None:
-        count = db.queue_count(MAX_RETRIES)
-        if count:
-            log.info(f"📥 {count} offline event(s) pending retry")
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="queue-flusher"
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="heartbeat")
+        self._thread.start()
+        log.info("💓 Heartbeat started")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    def _loop(self) -> None:
+        send_heartbeat(
+            camera_id=self._camera_id,
+            camera_online=bool(self._cam_status()),
+            queue_depth=db.queue_count(),
         )
+        while not self._stop.is_set():
+            self._stop.wait(config.HEARTBEAT_INTERVAL_S)
+            if self._stop.is_set():
+                break
+            try:
+                ok = send_heartbeat(
+                    camera_id=self._camera_id,
+                    camera_online=bool(self._cam_status()),
+                    queue_depth=db.queue_count(),
+                )
+                # Detect revocation: license was marked revoked by send_heartbeat()
+                if not ok:
+                    lic = db.license_get() or {}
+                    if lic.get("revoked") and self._on_revoked:
+                        try:
+                            self._on_revoked()
+                        except Exception as e:
+                            log.error(f"on_revoked callback error: {e}")
+                        return
+            except Exception as e:
+                log.warning(f"heartbeat loop error: {e}")
+
+
+# ─── Offline queue flusher ──────────────────────────────────────────────────
+class QueueFlusher:
+    """
+    Periodically retries events from the local sqlite queue.
+    Routes PermanentFailure → dead_letter, TransientFailure → bumps retry_count.
+    """
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        n = db.queue_count()
+        if n:
+            log.info(f"📥 {n} offline event(s) pending retry")
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="queue-flusher")
         self._thread.start()
         log.info("🔄 Queue flusher started")
 
@@ -143,138 +205,51 @@ class QueueFlusher:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self._stop.wait(RETRY_INTERVAL)
+            self._stop.wait(config.QUEUE_FLUSH_INTERVAL_S)
             if self._stop.is_set():
                 break
             self._flush()
 
     def _flush(self) -> None:
-        rows = db.pending(MAX_RETRIES)
+        rows = db.pending()
         if not rows:
             return
         log.info(f"🔄 Retrying {len(rows)} queued event(s)…")
-        sent = dropped = 0
+        sent = dropped = failed = 0
         for row in rows:
-            result = post_event(
-                lavvaggio_id=row["lavvaggio_id"],
-                plate=row["plate"],
-                vehicle_type=row["vehicle_type"],
-                started_at=row["started_at"],
-                ended_at=row["ended_at"],
-                device_id=row["device_id"],
-                confidence=row["confidence"] if "confidence" in row.keys() else None,
-            )
-            if result is True:
+            payload = {
+                "plate":        row["plate"],
+                "vehicle_type": row["vehicle_type"],
+                "started_at":   row["started_at"],
+                "ended_at":     row["ended_at"],
+                "confidence":   row["confidence"],
+                "camera_id":    row["camera_id"],
+            }
+            try:
+                post_event(payload)
                 db.mark_sent(row["id"])
                 sent += 1
-            elif result is _PERMANENT_FAILURE:
-                # Invalid payload — retrying will never succeed; drop it
+            except PermanentFailure as pf:
+                db.dead_letter_add(payload=payload,
+                                   error_code=pf.status, error_body=pf.body)
                 db.mark_sent(row["id"])
                 dropped += 1
-                log.warning(
-                    f"Dropped invalid queued event (plate={row['plate']} "
-                    f"started={row['started_at']} ended={row['ended_at']})"
-                )
-            else:
+            except TransientFailure:
                 db.mark_failed(row["id"])
+                failed += 1
         if sent or dropped:
-            log.info(f"✅ Flushed {sent}/{len(rows)} event(s)" +
-                     (f"  dropped {dropped} invalid" if dropped else ""))
-        else:
-            log.warning(f"Flush: 0/{len(rows)} sent — API still unreachable")
+            msg = f"✅ Flushed {sent}/{len(rows)}"
+            if dropped:
+                msg += f"  dead-lettered {dropped}"
+            log.info(msg)
+        elif failed:
+            log.warning(f"Flush: 0/{len(rows)} sent — backend still unreachable")
 
 
-# ── Heartbeat ────────────────────────────────────────────────────────────────
-HEARTBEAT_INTERVAL = 60  # seconds
+# ─── helpers ────────────────────────────────────────────────────────────────
+def _strip_none(d: dict) -> dict:
+    return {k: v for k, v in d.items() if v is not None}
 
 
-def send_heartbeat(device_id: int, device_token: str, camera_online: bool = None) -> bool:
-    """
-    POST /api/v1/devices/{device_id}/heartbeat with the device token.
-    Non-fatal: logs at debug level on success, warning on failure, never raises.
-
-    When camera_online is not None, includes it in the request body so the backend
-    can track the camera device's status independently.
-    """
-    if not device_id or not device_token:
-        log.debug("heartbeat skipped — missing device_id or device_token")
-        return False
-
-    url = f"{_v1()}/devices/{device_id}/heartbeat"
-    headers = {"Authorization": f"Bearer {device_token}"}
-
-    body = {}
-    if camera_online is not None:
-        body["camera_online"] = camera_online
-
-    try:
-        r = requests.post(url, headers=headers, json=body if body else None, timeout=8)
-        if r.status_code == 200:
-            cam_status = f"  camera={'online' if camera_online else 'offline'}" if camera_online is not None else ""
-            log.debug(f"💓 heartbeat ok (device_id={device_id}){cam_status}")
-            return True
-        log.warning(f"heartbeat failed: HTTP {r.status_code} — {r.text[:120]}")
-        return False
-    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-        log.debug("heartbeat: API unreachable")
-        return False
-    except Exception as e:
-        log.warning(f"heartbeat error: {e}")
-        return False
-
-
-class HeartbeatThread:
-    """
-    Background thread that POSTs a heartbeat to the backend every HEARTBEAT_INTERVAL
-    seconds. Failures are non-fatal. Stopped cleanly on shutdown.
-
-    Also reports camera_online status so the backend can track the camera device
-    independently from the mini_pc.
-    """
-
-    def __init__(self, device_id: int, device_token: str, camera_status_fn=None):
-        """
-        Args:
-            device_id:        The mini_pc device ID registered on the backend.
-            device_token:     Bearer token for API authentication.
-            camera_status_fn: Callable returning bool (True if camera is connected).
-                              When None, camera_online defaults to True.
-        """
-        self._device_id        = device_id
-        self._device_token     = device_token
-        self._camera_status_fn = camera_status_fn
-        self._stop             = threading.Event()
-        self._thread           = None
-
-    def start(self) -> None:
-        if not self._device_id or not self._device_token:
-            log.warning("Heartbeat disabled — no device_id or device_token")
-            return
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="heartbeat"
-        )
-        self._thread.start()
-        log.info("💓 Heartbeat started (with camera status reporting)")
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=3)
-
-    def _get_camera_online(self) -> bool:
-        if self._camera_status_fn is not None:
-            try:
-                return bool(self._camera_status_fn())
-            except Exception as e:
-                log.debug(f"camera_status_fn error: {e}")
-                return False
-        return True  # default: assume camera is connected
-
-    def _loop(self) -> None:
-        # Send one immediately so the backend knows we're online
-        send_heartbeat(self._device_id, self._device_token, camera_online=self._get_camera_online())
-        while not self._stop.is_set():
-            self._stop.wait(HEARTBEAT_INTERVAL)
-            if self._stop.is_set():
-                break
-            send_heartbeat(self._device_id, self._device_token, camera_online=self._get_camera_online())
+def _round_or_none(v, ndigits):
+    return round(float(v), ndigits) if v is not None else None

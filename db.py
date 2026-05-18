@@ -1,14 +1,29 @@
+"""
+SQLite persistence for the detector.
+
+Tables
+──────
+  kv           Generic key/value: api_url, lavvaggio_id, camera_id, ...
+               (Renamed from `session` to break the "session = login" mental model
+                that came with the old auth flow. Migration handled below.)
+  license      The signed JWT, server-issued timestamps, refresh bookkeeping.
+  cameras      Last-known camera list from the backend (so we work offline).
+  queue        Retry queue for events that didn't post.
+  dead_letter  Events the backend permanently rejected (422). Never deleted
+               automatically — operator inspects with --show-deadletter.
+"""
 import sqlite3
 import logging
-from pathlib import Path
 from datetime import datetime, timezone
+
+import config
+
+log = logging.getLogger("laventra")
+DB_PATH = config.DB_PATH
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-log     = logging.getLogger("laventra")
-DB_PATH = Path(__file__).parent / "laventra.db"
 
 
 def _conn() -> sqlite3.Connection:
@@ -21,115 +36,259 @@ def _conn() -> sqlite3.Connection:
 def init() -> None:
     with _conn() as con:
         con.executescript("""
-            CREATE TABLE IF NOT EXISTS session (
+            CREATE TABLE IF NOT EXISTS kv (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS license (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                license_jwt     TEXT    NOT NULL,
+                license_id      TEXT,
+                device_id       INTEGER,
+                lavvaggio_id    INTEGER,
+                issued_at       TEXT,
+                expires_at      TEXT,
+                last_refresh_at TEXT,
+                revoked         INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS cameras (
+                id          INTEGER PRIMARY KEY,
+                name        TEXT    NOT NULL,
+                stream_url  TEXT    NOT NULL,
+                kind        TEXT,
+                metadata    TEXT,
+                updated_at  TEXT    NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS queue (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                lavvaggio_id  INTEGER NOT NULL,
-                device_id     INTEGER,
                 plate         TEXT    NOT NULL,
                 vehicle_type  TEXT    NOT NULL DEFAULT 'unknown',
                 started_at    TEXT    NOT NULL,
                 ended_at      TEXT    NOT NULL,
                 confidence    REAL,
+                camera_id     INTEGER,
                 retry_count   INTEGER NOT NULL DEFAULT 0,
                 created_at    TEXT    NOT NULL,
                 last_tried_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS dead_letter (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                plate         TEXT,
+                vehicle_type  TEXT,
+                started_at    TEXT,
+                ended_at      TEXT,
+                confidence    REAL,
+                camera_id     INTEGER,
+                error_code    INTEGER,
+                error_body    TEXT,
+                payload_json  TEXT,
+                created_at    TEXT    NOT NULL
+            );
         """)
-        # Idempotent upgrade for existing installs created before the column
-        # was added to the schema above.
-        try:
-            con.execute("ALTER TABLE queue ADD COLUMN confidence REAL")
-        except sqlite3.OperationalError:
-            pass
+        _migrate_legacy(con)
     log.debug(f"DB ready → {DB_PATH}")
 
 
-def session_get(key: str, default: str = None):
+def _migrate_legacy(con: sqlite3.Connection) -> None:
+    """
+    Migrate from the pre-license schema:
+      - Move `session` rows into `kv`, but DROP the password row before it migrates.
+      - Drop the old `token` and `device_token` rows (license replaces both).
+    Idempotent: safe to run on a fresh DB.
+    """
+    try:
+        has_session = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session'"
+        ).fetchone()
+        if not has_session:
+            return
+
+        # Carry forward only the keys still meaningful under the license model.
+        keep_keys = {
+            "api_url", "lavvaggio_id", "lavvaggio_name",
+            "camera_id", "camera_url", "camera_port",
+            "device_serial",
+        }
+        rows = con.execute("SELECT key, value FROM session").fetchall()
+        carried = 0
+        for r in rows:
+            if r["key"] in keep_keys and r["value"]:
+                con.execute(
+                    "INSERT INTO kv (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (r["key"], r["value"]),
+                )
+                carried += 1
+        # Plaintext password and old user-JWT must not survive the migration.
+        con.execute("DROP TABLE session")
+        log.info(f"Migrated {carried} legacy session entries; legacy auth/password rows dropped")
+    except Exception as e:
+        log.warning(f"Legacy migration skipped: {e}")
+
+
+# ── kv (generic key/value) ──────────────────────────────────────────────────
+def kv_get(key: str, default: str = None):
     try:
         with _conn() as con:
-            row = con.execute(
-                "SELECT value FROM session WHERE key = ?", (key,)
-            ).fetchone()
+            row = con.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
     except Exception as e:
         log.error(f"DB read error ({key}): {e}")
         return default
 
 
-def session_set(key: str, value) -> None:
+def kv_set(key: str, value) -> None:
     try:
         with _conn() as con:
             con.execute(
-                """
-                INSERT INTO session (key, value) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
+                "INSERT INTO kv (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, str(value)),
             )
     except Exception as e:
         log.error(f"DB write error ({key}): {e}")
 
 
-def session_clear() -> None:
+def kv_delete(key: str) -> None:
     try:
         with _conn() as con:
-            con.execute("DELETE FROM session")
-        log.info("Session cleared")
+            con.execute("DELETE FROM kv WHERE key = ?", (key,))
     except Exception as e:
-        log.error(f"DB clear error: {e}")
+        log.error(f"DB delete error ({key}): {e}")
 
 
-def has_session() -> bool:
-    # A "ready" session requires a device token (set during --setup) and a lavvaggio
-    return bool(session_get("device_token")) and bool(session_get("lavvaggio_id"))
+# ── license ─────────────────────────────────────────────────────────────────
+def license_save(jwt_str: str, *, license_id: str, device_id: int,
+                 lavvaggio_id: int, issued_at: str, expires_at: str) -> None:
+    try:
+        with _conn() as con:
+            con.execute(
+                """
+                INSERT INTO license (id, license_jwt, license_id, device_id,
+                                     lavvaggio_id, issued_at, expires_at,
+                                     last_refresh_at, revoked)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(id) DO UPDATE SET
+                    license_jwt     = excluded.license_jwt,
+                    license_id      = excluded.license_id,
+                    device_id       = excluded.device_id,
+                    lavvaggio_id    = excluded.lavvaggio_id,
+                    issued_at       = excluded.issued_at,
+                    expires_at      = excluded.expires_at,
+                    last_refresh_at = excluded.last_refresh_at,
+                    revoked         = 0
+                """,
+                (jwt_str, license_id, device_id, lavvaggio_id,
+                 issued_at, expires_at, _utc_now()),
+            )
+    except Exception as e:
+        log.error(f"License save error: {e}")
 
 
-def session_summary() -> dict:
-    return {
-        "api_url":        session_get("api_url",        "—"),
-        "email":          session_get("email",           "—"),
-        "lavvaggio_id":   session_get("lavvaggio_id",   "—"),
-        "lavvaggio_name": session_get("lavvaggio_name", "—"),
-        "device_id":      session_get("device_id",      "—"),
-        "camera_url":     session_get("camera_url",     "—"),
-        "camera_port":    session_get("camera_port",    "—"),
-        "token_set":      "yes" if session_get("token") else "no",
-        "device_token_set": "yes" if session_get("device_token") else "no",
-    }
+def license_get() -> dict | None:
+    try:
+        with _conn() as con:
+            row = con.execute("SELECT * FROM license WHERE id = 1").fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        log.error(f"License read error: {e}")
+        return None
 
 
-def enqueue(
-    lavvaggio_id: int,
-    plate: str,
-    vehicle_type: str,
-    started_at: str,
-    ended_at: str,
-    device_id: int = None,
-    confidence: float = None,
-) -> None:
+def license_mark_refresh() -> None:
+    try:
+        with _conn() as con:
+            con.execute("UPDATE license SET last_refresh_at = ? WHERE id = 1", (_utc_now(),))
+    except Exception as e:
+        log.error(f"License mark-refresh error: {e}")
+
+
+def license_mark_revoked() -> None:
+    try:
+        with _conn() as con:
+            con.execute("UPDATE license SET revoked = 1 WHERE id = 1")
+    except Exception as e:
+        log.error(f"License mark-revoked error: {e}")
+
+
+def license_clear() -> None:
+    try:
+        with _conn() as con:
+            con.execute("DELETE FROM license")
+    except Exception as e:
+        log.error(f"License clear error: {e}")
+
+
+# ── cameras ─────────────────────────────────────────────────────────────────
+def cameras_replace(camera_list: list) -> None:
+    """Replace the entire cameras table with the given list of dicts."""
+    try:
+        now = _utc_now()
+        with _conn() as con:
+            con.execute("DELETE FROM cameras")
+            for c in camera_list:
+                con.execute(
+                    """
+                    INSERT INTO cameras (id, name, stream_url, kind, metadata, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(c["id"]),
+                        c.get("name", f"Camera {c['id']}"),
+                        c["stream_url"],
+                        c.get("kind"),
+                        c.get("metadata_json"),
+                        now,
+                    ),
+                )
+    except Exception as e:
+        log.error(f"cameras_replace error: {e}")
+
+
+def cameras_list() -> list:
+    try:
+        with _conn() as con:
+            return [dict(r) for r in con.execute(
+                "SELECT * FROM cameras ORDER BY id ASC"
+            ).fetchall()]
+    except Exception as e:
+        log.error(f"cameras_list error: {e}")
+        return []
+
+
+def cameras_get(camera_id: int) -> dict | None:
+    try:
+        with _conn() as con:
+            row = con.execute(
+                "SELECT * FROM cameras WHERE id = ?", (camera_id,)
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        log.error(f"cameras_get error: {e}")
+        return None
+
+
+# ── queue (retry on transient failure) ──────────────────────────────────────
+def enqueue(*, plate: str, vehicle_type: str, started_at: str, ended_at: str,
+            confidence: float = None, camera_id: int = None) -> None:
     try:
         now = _utc_now()
         with _conn() as con:
             con.execute(
                 """
-                INSERT INTO queue
-                  (lavvaggio_id, device_id, plate, vehicle_type,
-                   started_at, ended_at, confidence, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO queue (plate, vehicle_type, started_at, ended_at,
+                                   confidence, camera_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (lavvaggio_id, device_id, plate, vehicle_type,
-                 started_at, ended_at, confidence, now),
+                (plate, vehicle_type, started_at, ended_at,
+                 confidence, camera_id, now),
             )
-        log.info(f"📥 Queued offline → {plate}")
     except Exception as e:
-        log.error(f"Failed to queue event ({plate}): {e}")
+        log.error(f"enqueue error ({plate}): {e}")
 
 
-def pending(max_retries: int = 10, limit: int = 20) -> list:
+def pending(max_retries: int = config.QUEUE_MAX_RETRIES,
+            limit: int = config.QUEUE_BATCH_LIMIT) -> list:
     try:
         with _conn() as con:
             return con.execute(
@@ -142,7 +301,7 @@ def pending(max_retries: int = 10, limit: int = 20) -> list:
                 (max_retries, limit),
             ).fetchall()
     except Exception as e:
-        log.error(f"Failed to read queue: {e}")
+        log.error(f"pending error: {e}")
         return []
 
 
@@ -151,47 +310,112 @@ def mark_sent(event_id: int) -> None:
         with _conn() as con:
             con.execute("DELETE FROM queue WHERE id = ?", (event_id,))
     except Exception as e:
-        log.error(f"Failed to delete queued event {event_id}: {e}")
+        log.error(f"mark_sent error {event_id}: {e}")
 
 
 def mark_failed(event_id: int) -> None:
     try:
-        now = _utc_now()
         with _conn() as con:
             con.execute(
-                """
-                UPDATE queue
-                SET retry_count   = retry_count + 1,
-                    last_tried_at = ?
-                WHERE id = ?
-                """,
-                (now, event_id),
+                "UPDATE queue SET retry_count = retry_count + 1, last_tried_at = ? WHERE id = ?",
+                (_utc_now(), event_id),
             )
     except Exception as e:
-        log.error(f"Failed to update retry count {event_id}: {e}")
+        log.error(f"mark_failed error {event_id}: {e}")
 
 
 def queue_clear() -> int:
-    """Delete all queued events. Returns the number of rows removed."""
     try:
         with _conn() as con:
-            n = con.execute("SELECT COUNT(*) as n FROM queue").fetchone()["n"]
+            n = con.execute("SELECT COUNT(*) AS n FROM queue").fetchone()["n"]
             con.execute("DELETE FROM queue")
-        log.info(f"Queue cleared ({n} event(s) removed)")
         return n
     except Exception as e:
-        log.error(f"Failed to clear queue: {e}")
+        log.error(f"queue_clear error: {e}")
         return 0
 
 
-def queue_count(max_retries: int = 10) -> int:
+def queue_count(max_retries: int = config.QUEUE_MAX_RETRIES) -> int:
     try:
         with _conn() as con:
             row = con.execute(
-                "SELECT COUNT(*) as n FROM queue WHERE retry_count < ?",
+                "SELECT COUNT(*) AS n FROM queue WHERE retry_count < ?",
                 (max_retries,),
             ).fetchone()
         return row["n"] if row else 0
     except Exception as e:
-        log.error(f"Failed to count queue: {e}")
+        log.error(f"queue_count error: {e}")
         return 0
+
+
+# ── dead_letter (permanent failures) ────────────────────────────────────────
+def dead_letter_add(*, payload: dict, error_code: int, error_body: str) -> None:
+    import json
+    try:
+        with _conn() as con:
+            con.execute(
+                """
+                INSERT INTO dead_letter
+                  (plate, vehicle_type, started_at, ended_at, confidence,
+                   camera_id, error_code, error_body, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    payload.get("plate"),
+                    payload.get("vehicle_type"),
+                    payload.get("started_at"),
+                    payload.get("ended_at"),
+                    payload.get("confidence"),
+                    payload.get("camera_id"),
+                    error_code,
+                    error_body[:2000] if error_body else None,
+                    json.dumps(payload, default=str),
+                    _utc_now(),
+                ),
+            )
+    except Exception as e:
+        log.error(f"dead_letter_add error: {e}")
+
+
+def dead_letter_count() -> int:
+    try:
+        with _conn() as con:
+            return con.execute("SELECT COUNT(*) AS n FROM dead_letter").fetchone()["n"]
+    except Exception as e:
+        log.error(f"dead_letter_count error: {e}")
+        return 0
+
+
+def dead_letter_list(limit: int = 50) -> list:
+    try:
+        with _conn() as con:
+            return [dict(r) for r in con.execute(
+                "SELECT * FROM dead_letter ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()]
+    except Exception as e:
+        log.error(f"dead_letter_list error: {e}")
+        return []
+
+
+# ── Summary for --status ────────────────────────────────────────────────────
+def status_summary() -> dict:
+    lic = license_get() or {}
+    return {
+        "api_url":         kv_get("api_url",        "—"),
+        "license_id":      lic.get("license_id",    "—"),
+        "lavvaggio_id":    lic.get("lavvaggio_id",  "—"),
+        "lavvaggio_name":  kv_get("lavvaggio_name", "—"),
+        "device_id":       lic.get("device_id",     "—"),
+        "camera_id":       kv_get("camera_id",      "—"),
+        "license_set":     "yes" if lic.get("license_jwt") else "no",
+        "license_expires": lic.get("expires_at",    "—"),
+        "license_revoked": "yes" if lic.get("revoked") else "no",
+        "queue":           queue_count(),
+        "dead_letter":     dead_letter_count(),
+    }
+
+
+def has_license() -> bool:
+    lic = license_get()
+    return bool(lic and lic.get("license_jwt") and not lic.get("revoked"))
