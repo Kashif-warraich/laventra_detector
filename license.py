@@ -224,7 +224,9 @@ def activate(*, api_url: str, activation_code: str) -> dict:
         )
 
     data = r.json() or {}
-    token = data.get("license_jwt")
+    # Rails wraps responses as { status, data: { ... } } — unwrap if needed
+    payload = data.get("data", data) if isinstance(data.get("data"), dict) else data
+    token = payload.get("license_jwt")
     if not token:
         raise ActivationError("Activation succeeded but response had no license_jwt")
 
@@ -293,10 +295,12 @@ def refresh() -> dict | None:
         return None
 
     data = r.json() or {}
-    if data.get("revoked"):
+    # Rails wraps responses as { status, data: { ... } } — unwrap if needed
+    payload = data.get("data", data) if isinstance(data.get("data"), dict) else data
+    if payload.get("revoked"):
         db.license_mark_revoked()
         raise LicenseRevoked("Refresh returned revoked=true")
-    new_jwt = data.get("license_jwt") or lic["license_jwt"]
+    new_jwt = payload.get("license_jwt") or lic["license_jwt"]
     claims = verify_jwt(new_jwt)
     db.license_save(
         new_jwt,
