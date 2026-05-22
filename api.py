@@ -84,7 +84,6 @@ def post_event(payload: dict) -> bool:
     if r.status_code in (200, 201):
         return True
     if r.status_code == 401:
-        db.license_mark_revoked()
         raise PermanentFailure(
             "License rejected by backend",
             status=401, body=r.text[:400],
@@ -119,24 +118,18 @@ def send_heartbeat(*, camera_id=None, camera_online: bool = None,
 
     if r.status_code == 200:
         return True
-    if r.status_code == 401:
-        # License revoked — escalate (audit H5)
-        db.license_mark_revoked()
-        log.error("❌ Heartbeat: license rejected — backend revoked this device")
-        return False
-    log.warning(f"heartbeat failed: HTTP {r.status_code} — {r.text[:120]}")
+    log.warning(f"heartbeat: HTTP {r.status_code}")
     return False
 
 
 class HeartbeatThread:
     """
-    Periodic heartbeat. On 401 (license revoked) fires `on_revoked` once and exits.
+    Periodic heartbeat. Sends device status to the backend on a regular cadence.
     """
 
-    def __init__(self, *, camera_status_fn=None, camera_id=None, on_revoked=None):
+    def __init__(self, *, camera_status_fn=None, camera_id=None):
         self._cam_status = camera_status_fn or (lambda: True)
         self._camera_id = camera_id
-        self._on_revoked = on_revoked
         self._stop = threading.Event()
         self._thread = None
 
@@ -161,20 +154,11 @@ class HeartbeatThread:
             if self._stop.is_set():
                 break
             try:
-                ok = send_heartbeat(
+                send_heartbeat(
                     camera_id=self._camera_id,
                     camera_online=bool(self._cam_status()),
                     queue_depth=db.queue_count(),
                 )
-                # Detect revocation: license was marked revoked by send_heartbeat()
-                if not ok:
-                    lic = db.license_get() or {}
-                    if lic.get("revoked") and self._on_revoked:
-                        try:
-                            self._on_revoked()
-                        except Exception as e:
-                            log.error(f"on_revoked callback error: {e}")
-                        return
             except Exception as e:
                 log.warning(f"heartbeat loop error: {e}")
 
@@ -211,6 +195,17 @@ class QueueFlusher:
             self._flush()
 
     def _flush(self) -> None:
+        # Skip if license is locally invalid — queued events would be rejected
+        lic = db.license_get() or {}
+        token = lic.get("license_jwt")
+        if not token:
+            return
+        try:
+            license_module.verify_jwt(token)
+        except license_module.LicenseInvalid:
+            log.debug("Queue flush skipped — license invalid")
+            return
+
         rows = db.pending()
         if not rows:
             return

@@ -23,9 +23,21 @@ Optional single-stage mode (config.USE_TWO_STAGE = False):
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from pathlib import Path
+
+# The plate model (keremberke/yolov5n-license-plate) is a YOLOv5 .pt file
+# saved on Windows with an old yolov5 that embedded pkg_resources class
+# references in the pickle.  ultralytics.YOLO wraps torch.load in a
+# try/except that catches ModuleNotFoundError and then tries to
+# `pip install pkg_resources` — which fails because it's not a PyPI package.
+#
+# Fix: load the plate model via the `yolov5` package, which calls
+# torch.hub / torch.load directly with no requirements-check middleware.
+# A thin compat wrapper (see _YoloV5PlateModel below) re-exposes the same
+# .boxes / .conf / .xyxy / .id API that the rest of this file expects.
 
 import cv2
 import numpy as np
@@ -88,26 +100,21 @@ class _PaddleOCR(_OCRBackend):
 
     def __init__(self, use_gpu: bool = False):
         from paddleocr import PaddleOCR
-        # det=False: skip text detection — we already have the plate crop.
-        # use_angle_cls=True: 90/180/270 rotated plates still read correctly.
-        # lang='en': Latin-script plates; PaddleOCR has multilingual support
-        # if you ever need it (lang='ch', 'it'...).
-        self._ocr = PaddleOCR(
-            use_angle_cls=True,
-            lang="en",
-            use_gpu=use_gpu,
-            show_log=False,
-        )
+        # PaddleOCR 3.x dropped use_angle_cls / use_gpu / show_log — lang only.
+        self._ocr = PaddleOCR(lang="en")
 
     def read(self, crop_bgr: np.ndarray) -> tuple[str | None, float]:
-        # PaddleOCR expects RGB
-        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        # det=False → treats whole image as one text line; returns one result.
-        result = self._ocr.ocr(rgb, det=False, cls=True)
-        if not result or not result[0]:
+        # PaddleOCR 3.x returns a list of dicts with rec_texts / rec_scores.
+        result = self._ocr.ocr(crop_bgr)
+        if not result or not isinstance(result[0], dict):
             return None, 0.0
-        text, conf = result[0][0]
-        return text, float(conf)
+        texts  = result[0].get("rec_texts", [])
+        scores = result[0].get("rec_scores", [])
+        if not texts:
+            return None, 0.0
+        # Pick the highest-confidence reading
+        best_text, best_conf = max(zip(texts, scores), key=lambda x: x[1])
+        return best_text, float(best_conf)
 
 
 class _EasyOCR(_OCRBackend):
@@ -127,11 +134,14 @@ class _EasyOCR(_OCRBackend):
 
 
 def _build_ocr(use_gpu: bool) -> _OCRBackend:
+    import log_setup as _ls
     try:
         ocr = _PaddleOCR(use_gpu=use_gpu)
+        _ls.setup(debug=False)          # PaddleOCR wipes root logger handlers — restore them
         log.info("✅ OCR backend: PaddleOCR")
         return ocr
     except Exception as e:
+        _ls.setup(debug=False)
         log.warning(f"PaddleOCR unavailable ({e}) — falling back to EasyOCR")
     try:
         ocr = _EasyOCR(use_gpu=use_gpu)
@@ -140,6 +150,112 @@ def _build_ocr(use_gpu: bool) -> _OCRBackend:
     except Exception as e:
         log.error(f"Both OCR backends failed: {e}")
         raise
+
+
+# ─── YOLOv5 compat wrapper (plate model only) ───────────────────────────────
+# Wraps the yolov5 package's Detections result to expose the same
+# .boxes / box.conf / box.xyxy / box.id API used by the rest of this file.
+
+class _Box:
+    """Mimics ultralytics Results.boxes[i] for one detection."""
+    __slots__ = ("xyxy", "conf", "cls", "id")
+
+    def __init__(self, x1, y1, x2, y2, conf, cls, track_id=None):
+        import torch
+        self.xyxy = [torch.tensor([x1, y1, x2, y2])]
+        self.conf = [torch.tensor(conf)]
+        self.cls  = [torch.tensor(cls)]
+        self.id   = [torch.tensor(track_id)] if track_id is not None else None
+
+
+class _Boxes:
+    """Mimics ultralytics Results.boxes (iterable of _Box)."""
+    def __init__(self, pred_row):  # pred_row: tensor [N, 6]
+        self._boxes = [
+            _Box(float(r[0]), float(r[1]), float(r[2]), float(r[3]),
+                 float(r[4]), float(r[5]))
+            for r in pred_row
+        ]
+
+    def __iter__(self):
+        return iter(self._boxes)
+
+    def __len__(self):
+        return len(self._boxes)
+
+
+class _Result:
+    """Mimics a single ultralytics Results object."""
+    def __init__(self, pred_row):
+        self.boxes = _Boxes(pred_row)
+
+
+class _YoloV5PlateModel:
+    """
+    Loads a YOLOv5 .pt via the `yolov5` package (bypasses ultralytics'
+    requirements-check middleware that breaks on `pkg_resources`).
+    Exposes __call__ and .track() with the same return shape as ultralytics YOLO.
+    """
+
+    def __init__(self, weights: str, device: str = "cpu"):
+        import yolov5
+        # yolov5.load uses torch.hub under the hood — no pkg_resources check.
+        self._model = yolov5.load(weights, device=device, verbose=False)
+        self._next_id: dict = {}   # simple centroid tracker for single-stage mode
+        self._track_counter = 0
+
+    def to(self, device):
+        self._model.to(device)
+        return self
+
+    def __call__(self, img, verbose=False, **_):
+        """Plain inference — returns [_Result]."""
+        import torch
+        results = self._model(img, size=640)
+        pred = results.pred[0] if results.pred else torch.zeros((0, 6))
+        return [_Result(pred)]
+
+    def track(self, img, persist=False, verbose=False, **_):
+        """
+        Inference + naive centroid tracking (IoU-free, good-enough for the
+        single-stage path where the plate is the only detected object class).
+        Returns [_Result] with box.id populated.
+        """
+        import torch
+        results = self._model(img, size=640)
+        pred = results.pred[0] if results.pred else torch.zeros((0, 6))
+
+        # Assign stable IDs by matching to previous centroids (Euclidean NN).
+        new_state: dict = {}
+        boxes_with_ids = []
+        for r in pred:
+            x1, y1, x2, y2, conf, cls = (float(v) for v in r)
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+            # Find closest previous centroid within 80 px
+            best_id, best_d = None, 80.0
+            for tid, (px, py) in self._next_id.items():
+                d = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+                if d < best_d:
+                    best_d, best_id = d, tid
+
+            if best_id is None:
+                self._track_counter += 1
+                best_id = self._track_counter
+
+            new_state[best_id] = (cx, cy)
+            boxes_with_ids.append((x1, y1, x2, y2, conf, cls, best_id))
+
+        self._next_id = new_state
+
+        result_boxes = [_Box(x1, y1, x2, y2, conf, cls, tid)
+                        for x1, y1, x2, y2, conf, cls, tid in boxes_with_ids]
+
+        class _TrackedResult:
+            def __init__(self, boxes):
+                self.boxes = type('Boxes', (), {'__iter__': lambda s: iter(boxes),
+                                                '__len__': lambda s: len(boxes)})()
+        return [_TrackedResult(result_boxes)]
 
 
 # ─── PlateDetector ─────────────────────────────────────────────────────────
@@ -193,12 +309,10 @@ class PlateDetector:
 
     def _load_plate_model(self) -> None:
         try:
-            from ultralytics import YOLO
             log.info(f"Resolving plate model ({config.PLATE_MODEL_REPO})…")
             weights = _ensure_plate_model()
             log.info(f"Loading plate model on {self._device}…")
-            self._plate_model = YOLO(weights)
-            self._plate_model.to(self._device)
+            self._plate_model = _YoloV5PlateModel(weights, device=self._device)
             log.info("✅ Plate model ready")
         except Exception as e:
             log.error(f"Failed to load plate model: {e}")

@@ -23,8 +23,8 @@ QUEUE_MAX_RETRIES = 10
 QUEUE_BATCH_LIMIT = 20
 
 # ── License ──────────────────────────────────────────────────────────────────
-LICENSE_REFRESH_INTERVAL_S = 24 * 60 * 60          # 24h scheduled refresh
-LICENSE_OFFLINE_GRACE_S = 7 * 24 * 60 * 60         # accept locally-verified JWT for 7d after last refresh
+LICENSE_CHECK_INTERVAL_S = 24 * 60 * 60            # normal check cadence (24h)
+LICENSE_RETRY_INTERVAL_S = 5 * 60                  # retry cadence when license is invalid (5min)
 LICENSE_CLOCK_SKEW_S = 60                           # JWT exp/nbf leniency
 JWT_ISSUER = "laventra-backend"
 JWT_AUDIENCE = "laventra-detector"

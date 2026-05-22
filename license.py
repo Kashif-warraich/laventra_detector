@@ -76,7 +76,6 @@ import hashlib
 import logging
 import platform
 import socket
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -249,78 +248,51 @@ def activate(*, api_url: str, activation_code: str) -> dict:
     return claims
 
 
-# ─── Refresh ────────────────────────────────────────────────────────────────
-def refresh() -> dict | None:
+# ─── Boot-time revocation check ────────────────────────────────────────────
+def check_revocation_online() -> None:
     """
-    Attempt to refresh the stored license. Returns claims on success, None if
-    the backend is unreachable (caller falls back to LICENSE_OFFLINE_GRACE_S).
-    Raises LicenseRevoked if the backend explicitly revoked us.
+    Boot-time revocation check. Asks the backend once if this license is
+    still valid. Raises LicenseRevoked if the backend says so.
+    Silently returns if the backend is offline — the JWT exp is the fallback.
     """
     lic = db.license_get()
     if not lic or not lic.get("license_jwt"):
-        raise LicenseInvalid("No license stored")
+        return
     api_url = db.kv_get("api_url", "")
     if not api_url:
-        raise LicenseInvalid("No api_url stored")
-
+        return
     headers = {
         "Authorization": f"Bearer {lic['license_jwt']}",
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": config.USER_AGENT,
     }
-    body = {"device_fingerprint": device_fingerprint()}
     try:
         r = requests.post(
             _v1(api_url) + "/license/refresh",
             headers=headers,
-            json=body,
+            json={"device_fingerprint": device_fingerprint()},
             timeout=config.API_TIMEOUT_S,
         )
-    except requests.exceptions.RequestException as e:
-        log.debug(f"License refresh: backend unreachable ({e}) — staying on grace")
-        return None
-
-    if r.status_code == 401:
+    except requests.exceptions.RequestException:
+        log.debug("License revocation check: backend offline — trusting local JWT")
+        return
+    if r.status_code in (401, 403):
         db.license_mark_revoked()
-        raise LicenseRevoked("Backend revoked this license")
-    if r.status_code == 403:
-        db.license_mark_revoked()
-        raise LicenseRevoked("License non-renewable (expired admin-side)")
-    if r.status_code >= 500:
-        log.warning(f"License refresh: backend {r.status_code} — staying on grace")
-        return None
-    if r.status_code != 200:
-        log.warning(f"License refresh: HTTP {r.status_code} {r.text[:200]} — staying on grace")
-        return None
-
-    data = r.json() or {}
-    # Rails wraps responses as { status, data: { ... } } — unwrap if needed
-    payload = data.get("data", data) if isinstance(data.get("data"), dict) else data
-    if payload.get("revoked"):
-        db.license_mark_revoked()
-        raise LicenseRevoked("Refresh returned revoked=true")
-    new_jwt = payload.get("license_jwt") or lic["license_jwt"]
-    claims = verify_jwt(new_jwt)
-    db.license_save(
-        new_jwt,
-        license_id=claims.get("license_id", ""),
-        device_id=int(claims.get("sub") or 0),
-        lavvaggio_id=int(claims.get("lavvaggio_id") or 0),
-        issued_at=_ts_to_iso(claims.get("iat")),
-        expires_at=_ts_to_iso(claims.get("exp")),
-    )
-    db.license_mark_refresh()
-    log.debug(f"License refreshed — exp={_ts_to_iso(claims.get('exp'))}")
-    return claims
+        raise LicenseRevoked("License revoked by admin")
+    if r.status_code == 200:
+        data = r.json() or {}
+        payload = data.get("data", data) if isinstance(data.get("data"), dict) else data
+        if payload.get("revoked"):
+            db.license_mark_revoked()
+            raise LicenseRevoked("License revoked by admin")
 
 
 # ─── Status check (boot-time) ───────────────────────────────────────────────
 def ensure_valid() -> dict:
     """
-    Boot-time: load + verify the stored JWT. Within grace window, do not require
-    network. Outside grace, force refresh. Raises LicenseInvalid / LicenseRevoked.
-
+    Boot-time: verify the stored JWT locally, then do a single online
+    revocation check. Raises LicenseInvalid / LicenseRevoked on failure.
     Returns the verified claims.
     """
     lic = db.license_get()
@@ -328,30 +300,8 @@ def ensure_valid() -> dict:
         raise LicenseInvalid("No license — run: python main.py --activate CODE")
     if lic.get("revoked"):
         raise LicenseRevoked("License is revoked")
-    token = lic["license_jwt"]
-    claims = verify_jwt(token)
-
-    last_refresh = lic.get("last_refresh_at")
-    needs_online = False
-    if not last_refresh:
-        needs_online = True
-    else:
-        try:
-            ts = datetime.fromisoformat(last_refresh.replace("Z", "+00:00")).timestamp()
-            if time.time() - ts > config.LICENSE_OFFLINE_GRACE_S:
-                needs_online = True
-        except Exception:
-            needs_online = True
-
-    if needs_online:
-        log.info("License grace exceeded — refresh required")
-        new_claims = refresh()
-        if new_claims is not None:
-            return new_claims
-        raise LicenseInvalid(
-            "Cannot reach backend to refresh license, and offline grace exceeded. "
-            "Check network or re-activate."
-        )
+    claims = verify_jwt(lic["license_jwt"])
+    check_revocation_online()
     return claims
 
 
@@ -363,26 +313,110 @@ def bearer_header() -> dict:
     return {"Authorization": f"Bearer {lic['license_jwt']}"}
 
 
-# ─── Background refresher ───────────────────────────────────────────────────
-class LicenseRefresher:
+# ─── Runtime license checker ────────────────────────────────────────────────
+def _try_fetch_jwt() -> str:
     """
-    Background thread: refreshes the license once every LICENSE_REFRESH_INTERVAL_S.
-    On LicenseRevoked → invokes `on_revoked` callback (typically: shut down).
+    Attempt a license refresh against the backend.
+
+    Returns:
+        "valid"   — backend confirmed active; local JWT updated if renewed
+        "invalid" — backend explicitly says inactive / revoked (401 / 403)
+        "offline" — backend unreachable or 5xx; caller falls back to local JWT
+    """
+    lic = db.license_get()
+    if not lic or not lic.get("license_jwt"):
+        return "offline"
+    api_url = db.kv_get("api_url", "")
+    if not api_url:
+        return "offline"
+
+    headers = {
+        "Authorization": f"Bearer {lic['license_jwt']}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": config.USER_AGENT,
+    }
+    try:
+        r = requests.post(
+            _v1(api_url) + "/license/refresh",
+            headers=headers,
+            json={"device_fingerprint": device_fingerprint()},
+            timeout=config.API_TIMEOUT_S,
+        )
+    except requests.exceptions.RequestException as e:
+        log.debug(f"License refresh: backend unreachable ({e})")
+        return "offline"
+
+    if r.status_code in (401, 403):
+        return "invalid"
+    if r.status_code >= 500:
+        return "offline"
+    if r.status_code != 200:
+        log.debug(f"License refresh: unexpected HTTP {r.status_code}")
+        return "offline"
+
+    # 200 — backend confirmed active; update JWT if a new one was issued
+    data = r.json() or {}
+    payload = data.get("data", data) if isinstance(data.get("data"), dict) else data
+    if payload.get("revoked"):
+        return "invalid"
+    new_jwt = payload.get("license_jwt") or lic["license_jwt"]
+    try:
+        claims = verify_jwt(new_jwt)
+        db.license_save(
+            new_jwt,
+            license_id=claims.get("license_id", ""),
+            device_id=int(claims.get("sub") or 0),
+            lavvaggio_id=int(claims.get("lavvaggio_id") or 0),
+            issued_at=_ts_to_iso(claims.get("iat")),
+            expires_at=_ts_to_iso(claims.get("exp")),
+        )
+    except LicenseInvalid as e:
+        log.warning(f"License refresh: backend returned invalid JWT ({e})")
+        return "offline"
+    return "valid"
+
+
+class LicenseChecker:
+    """
+    Background thread that validates the license on a schedule and exposes
+    an `is_valid` flag for the main loop to gate detection.
+
+    Normal cadence : LICENSE_CHECK_INTERVAL_S  (24 h)
+    Retry cadence  : LICENSE_RETRY_INTERVAL_S  (5 min)
+
+    State transitions
+    ─────────────────
+    valid → invalid  : is_valid set False  → main loop pauses detection
+    invalid → valid  : is_valid set True   → main loop resumes detection
+
+    The detector process is never killed by this thread. The main loop and
+    queue flusher both read is_valid to decide whether to act.
     """
 
-    def __init__(self, on_revoked=None):
+    def __init__(self):
         import threading
-        self._on_revoked = on_revoked
-        self._stop = threading.Event()
+        self._stop  = threading.Event()
+        self._lock  = threading.Lock()
+        self._valid = True   # boot check already passed — start as valid
         self._thread = None
+
+    @property
+    def is_valid(self) -> bool:
+        with self._lock:
+            return self._valid
+
+    def _set_valid(self, value: bool) -> None:
+        with self._lock:
+            self._valid = value
 
     def start(self) -> None:
         import threading
         self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="license-refresher"
+            target=self._loop, daemon=True, name="license-checker"
         )
         self._thread.start()
-        log.info("🔐 License refresher started")
+        log.info("🔐 License checker started")
 
     def stop(self) -> None:
         self._stop.set()
@@ -390,24 +424,61 @@ class LicenseRefresher:
             self._thread.join(timeout=3)
 
     def _loop(self) -> None:
-        # Refresh once shortly after startup, then on the regular cadence.
-        self._stop.wait(60)
+        interval = config.LICENSE_CHECK_INTERVAL_S
+        in_retry  = False
+
         while not self._stop.is_set():
+            self._stop.wait(interval)
+            if self._stop.is_set():
+                break
+
             try:
-                refresh()
-            except LicenseRevoked as e:
-                log.error(f"❌ License revoked: {e}")
-                if self._on_revoked:
-                    try:
-                        self._on_revoked()
-                    except Exception as cb_e:
-                        log.error(f"on_revoked callback error: {cb_e}")
-                return
-            except LicenseError as e:
-                log.warning(f"License refresh problem: {e}")
+                valid = self._check()
             except Exception as e:
-                log.warning(f"License refresh unexpected error: {e}")
-            self._stop.wait(config.LICENSE_REFRESH_INTERVAL_S)
+                log.warning(f"License check error: {e}")
+                valid = False
+
+            self._set_valid(valid)
+
+            if valid:
+                if in_retry:
+                    log.info("✅ License valid — detection will resume")
+                    in_retry = False
+                interval = config.LICENSE_CHECK_INTERVAL_S
+            else:
+                if not in_retry:
+                    log.warning(
+                        f"⚠️  License invalid — detection paused. "
+                        f"Retrying every {config.LICENSE_RETRY_INTERVAL_S // 60} min. "
+                        f"Detection resumes automatically once reactivated."
+                    )
+                    in_retry = True
+                interval = config.LICENSE_RETRY_INTERVAL_S
+
+    def _check(self) -> bool:
+        """Return True if license is confirmed valid, False otherwise."""
+        status = _try_fetch_jwt()
+
+        if status == "valid":
+            return True
+
+        if status == "invalid":
+            log.warning("License check: backend says inactive or revoked")
+            return False
+
+        # Backend offline — fall back to local JWT expiry
+        lic   = db.license_get() or {}
+        token = lic.get("license_jwt")
+        if not token:
+            log.warning("License check: no local JWT and backend offline")
+            return False
+        try:
+            verify_jwt(token)
+            log.debug("License check: backend offline — local JWT still valid")
+            return True
+        except LicenseInvalid as e:
+            log.warning(f"License check: backend offline and local JWT expired ({e})")
+            return False
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────

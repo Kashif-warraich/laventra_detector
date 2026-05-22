@@ -42,7 +42,6 @@ import events as events_module
 
 log = logging.getLogger("laventra")
 _shutdown = False
-_exit_code = 0
 
 
 def _on_signal(sig, frame):
@@ -59,15 +58,6 @@ def _detect_gpu() -> bool:
         return bool(torch.cuda.is_available())
     except Exception:
         return False
-
-
-def _on_license_revoked():
-    """Called by HeartbeatThread / LicenseRefresher when backend revokes us."""
-    global _shutdown, _exit_code
-    log.error("❌ License revoked by backend — shutting down.")
-    log.error("   Run: python main.py --activate <new-code>")
-    _exit_code = 2
-    _shutdown = True
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────
@@ -341,8 +331,6 @@ def _cmd_test(source=None) -> int:
 
 # ─── Main runtime ──────────────────────────────────────────────────────────
 def _run_detector() -> int:
-    global _exit_code
-
     # 1) License check
     try:
         claims = license_module.ensure_valid()
@@ -408,27 +396,45 @@ def _run_detector() -> int:
     heartbeat = api.HeartbeatThread(
         camera_status_fn=lambda: cam_stream.connected,
         camera_id=cam_id,
-        on_revoked=_on_license_revoked,
     )
     heartbeat.start()
 
-    refresher = license_module.LicenseRefresher(on_revoked=_on_license_revoked)
-    refresher.start()
+    checker = license_module.LicenseChecker()
+    checker.start()
 
     log.info("✅ Detector running — Ctrl+C to stop")
     log.info(f"   Visit grace = {config.PRESENCE_GRACE_S}s  "
              f"(one event per vehicle per wash visit)")
     log.info("─" * 52)
 
-    visit_tracker = tracker_module.VisitTracker()
-    last_stats_ts = time.time()
+    visit_tracker    = tracker_module.VisitTracker()
+    last_stats_ts    = time.time()
     last_visit_check_ts = 0.0
+    license_was_valid   = True   # track transitions for log messages
 
     while not _shutdown:
         try:
+            license_ok = checker.is_valid
+
+            # ── License-invalid mode ─────────────────────────────────────────
+            if not license_ok:
+                if license_was_valid:
+                    # Transition valid → invalid: flush any in-flight visits
+                    for evt in visit_tracker.flush():
+                        evt["camera_id"] = cam_id
+                        dispatcher.submit(evt)
+                    license_was_valid = False
+                time.sleep(0.5)
+                continue
+
+            # ── Transition invalid → valid ───────────────────────────────────
+            if not license_was_valid:
+                log.info("▶️  License valid — detection resumed")
+                license_was_valid = True
+
+            # ── Normal detection ─────────────────────────────────────────────
             frame = cam_stream.read()
             if frame is None:
-                # Even without a frame, finalise visits whose grace expired.
                 if time.time() - last_visit_check_ts >= 1.0:
                     for evt in visit_tracker.collect_completed():
                         evt["camera_id"] = cam_id
@@ -464,6 +470,7 @@ def _run_detector() -> int:
                     f"camera={'✅' if cam_stream.connected else '❌'}"
                 )
                 last_stats_ts = time.time()
+
         except KeyboardInterrupt:
             break
         except Exception as e:
@@ -478,7 +485,7 @@ def _run_detector() -> int:
 
     log.info("Shutting down…")
     for stopper in (cam_stream.stop, dispatcher.stop, flusher.stop,
-                    heartbeat.stop, refresher.stop):
+                    heartbeat.stop, checker.stop):
         try:
             stopper()
         except Exception as e:
@@ -491,7 +498,7 @@ def _run_detector() -> int:
              f"dead-lettered={s['dead_letter']}")
     log.info("Goodbye.")
     print("─" * 52)
-    return _exit_code
+    return 0
 
 
 # ─── Entrypoint ────────────────────────────────────────────────────────────
