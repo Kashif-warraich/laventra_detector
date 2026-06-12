@@ -30,6 +30,9 @@ def _conn() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
+    # Three writer threads (heartbeat, flusher, dispatcher) share this DB. Wait
+    # up to 5s for a lock instead of raising "database is locked" immediately.
+    con.execute("PRAGMA busy_timeout=5000")
     return con
 
 
@@ -60,16 +63,17 @@ def init() -> None:
                 updated_at  TEXT    NOT NULL
             );
             CREATE TABLE IF NOT EXISTS queue (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                plate         TEXT    NOT NULL,
-                vehicle_type  TEXT    NOT NULL DEFAULT 'unknown',
-                started_at    TEXT    NOT NULL,
-                ended_at      TEXT    NOT NULL,
-                confidence    REAL,
-                camera_id     INTEGER,
-                retry_count   INTEGER NOT NULL DEFAULT 0,
-                created_at    TEXT    NOT NULL,
-                last_tried_at TEXT
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                plate           TEXT    NOT NULL,
+                vehicle_type    TEXT    NOT NULL DEFAULT 'unknown',
+                started_at      TEXT    NOT NULL,
+                ended_at        TEXT    NOT NULL,
+                confidence      REAL,
+                camera_id       INTEGER,
+                client_event_id TEXT,
+                retry_count     INTEGER NOT NULL DEFAULT 0,
+                created_at      TEXT    NOT NULL,
+                last_tried_at   TEXT
             );
             CREATE TABLE IF NOT EXISTS dead_letter (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,7 +90,19 @@ def init() -> None:
             );
         """)
         _migrate_legacy(con)
+        _ensure_column(con, "queue", "client_event_id", "TEXT")
     log.debug(f"DB ready → {DB_PATH}")
+
+
+def _ensure_column(con: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Add a column to an existing table if it's missing (idempotent migration)."""
+    try:
+        cols = {r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in cols:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            log.info(f"Migrated: added {table}.{column}")
+    except Exception as e:
+        log.warning(f"Column migration skipped ({table}.{column}): {e}")
 
 
 def _migrate_legacy(con: sqlite3.Connection) -> None:
@@ -270,18 +286,19 @@ def cameras_get(camera_id: int) -> dict | None:
 
 # ── queue (retry on transient failure) ──────────────────────────────────────
 def enqueue(*, plate: str, vehicle_type: str, started_at: str, ended_at: str,
-            confidence: float = None, camera_id: int = None) -> None:
+            confidence: float = None, camera_id: int = None,
+            client_event_id: str = None) -> None:
     try:
         now = _utc_now()
         with _conn() as con:
             con.execute(
                 """
                 INSERT INTO queue (plate, vehicle_type, started_at, ended_at,
-                                   confidence, camera_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                   confidence, camera_id, client_event_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (plate, vehicle_type, started_at, ended_at,
-                 confidence, camera_id, now),
+                 confidence, camera_id, client_event_id, now),
             )
     except Exception as e:
         log.error(f"enqueue error ({plate}): {e}")

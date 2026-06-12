@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
@@ -209,11 +210,14 @@ class VisitTracker:
         else:
             ended_iso = _ts_to_iso(last_ts)
         return {
-            "plate":         plate,
-            "vehicle_type":  v["vehicle_type"],
-            "started_at":    v["started_iso"],
-            "ended_at":      ended_iso,
-            "confidence":    round(ocr_conf * 100, 2),
-            "track_id":      track_id,
-            "reading_count": len(v["readings"]),
+            "plate":           plate,
+            "vehicle_type":    v["vehicle_type"],
+            "started_at":      v["started_iso"],
+            "ended_at":        ended_iso,
+            "confidence":      round(ocr_conf * 100, 2),
+            "track_id":        track_id,
+            "reading_count":   len(v["readings"]),
+            # Stable idempotency key — reused across offline-queue retries so the
+            # backend can dedupe if a success response is ever lost in transit.
+            "client_event_id": str(uuid.uuid4()),
         }

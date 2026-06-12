@@ -307,6 +307,8 @@ class CameraStream:
 
     def _maybe_start_rediscovery(self) -> None:
         """Kick off subnet scan in the background, rate-limited."""
+        if not getattr(config, "CAMERA_AUTO_REDISCOVERY", True):
+            return
         now = time.time()
         if now - self._last_rediscovery < config.CAMERA_REDISCOVERY_COOLDOWN_S:
             return

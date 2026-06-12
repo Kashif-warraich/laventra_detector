@@ -65,12 +65,13 @@ def post_event(payload: dict) -> bool:
     Raises TransientFailure on network / 5xx (caller writes queue).
     """
     body = {"car_wash_event": _strip_none({
-        "vehicle_plate": payload["plate"],
-        "vehicle_type":  payload.get("vehicle_type"),
-        "started_at":    payload["started_at"],
-        "ended_at":      payload["ended_at"],
-        "confidence":    _round_or_none(payload.get("confidence"), 2),
-        "camera_id":     payload.get("camera_id"),
+        "vehicle_plate":   payload["plate"],
+        "vehicle_type":    payload.get("vehicle_type"),
+        "started_at":      payload["started_at"],
+        "ended_at":        payload["ended_at"],
+        "confidence":      _round_or_none(payload.get("confidence"), 2),
+        "camera_id":       payload.get("camera_id"),
+        "client_event_id": payload.get("client_event_id"),
     })}
     url = f"{_v1()}/car_wash_events"
     try:
@@ -213,12 +214,13 @@ class QueueFlusher:
         sent = dropped = failed = 0
         for row in rows:
             payload = {
-                "plate":        row["plate"],
-                "vehicle_type": row["vehicle_type"],
-                "started_at":   row["started_at"],
-                "ended_at":     row["ended_at"],
-                "confidence":   row["confidence"],
-                "camera_id":    row["camera_id"],
+                "plate":           row["plate"],
+                "vehicle_type":    row["vehicle_type"],
+                "started_at":      row["started_at"],
+                "ended_at":        row["ended_at"],
+                "confidence":      row["confidence"],
+                "camera_id":       row["camera_id"],
+                "client_event_id": row["client_event_id"],
             }
             try:
                 post_event(payload)

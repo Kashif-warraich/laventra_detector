@@ -119,10 +119,11 @@ _SENTINEL = object()
 
 def _to_queue_kwargs(payload: dict) -> dict:
     return {
-        "plate":        payload["plate"],
-        "vehicle_type": payload.get("vehicle_type", "unknown"),
-        "started_at":   payload["started_at"],
-        "ended_at":     payload["ended_at"],
-        "confidence":   payload.get("confidence"),
-        "camera_id":    payload.get("camera_id"),
+        "plate":           payload["plate"],
+        "vehicle_type":    payload.get("vehicle_type", "unknown"),
+        "started_at":      payload["started_at"],
+        "ended_at":        payload["ended_at"],
+        "confidence":      payload.get("confidence"),
+        "camera_id":       payload.get("camera_id"),
+        "client_event_id": payload.get("client_event_id"),
     }

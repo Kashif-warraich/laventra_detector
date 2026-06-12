@@ -31,6 +31,10 @@ JWT_AUDIENCE = "laventra-detector"
 JWT_ALGORITHM = "RS256"
 
 # ── Camera ───────────────────────────────────────────────────────────────────
+# When the camera drops, optionally scan the local /24 to find it at a new IP.
+# Disable on customer networks where an active port scan would trip an IDS, or
+# where the camera IP is pinned via a DHCP reservation.
+CAMERA_AUTO_REDISCOVERY = True
 CAMERA_RECONNECT_DELAY_S = 10
 CAMERA_RECONNECT_MAX_DELAY_S = 60                   # cap exponential backoff
 CAMERA_FAILURE_THRESHOLD = 30                       # consecutive read fails → drop+reopen
