@@ -1,6 +1,29 @@
+# Core
 numpy==1.26.4
 opencv-python==4.8.1.78
+requests==2.32.3
+
+# License (RS256 JWT)
+PyJWT[crypto]>=2.9.0,<3.0
+cryptography>=43.0.1,<46.0.0
+
+# Detection — vehicle stage uses ultralytics; plate stage uses a plate-fine-tuned
+# YOLOv5 weights file loaded via the same ultralytics YOLO() API.
 torch==2.2.2
-easyocr==1.7.1
+torchvision==0.17.2
 ultralytics==8.0.196
-requests
+
+# OCR — EasyOCR is the bundled default. Works out of the box on Python 3.12.
+easyocr==1.7.1
+
+# Lazy plate-model download from Hugging Face
+huggingface_hub==0.24.7
+
+# ── Optional accuracy upgrade ────────────────────────────────────────────────
+# PaddleOCR is ~5–10% more accurate than EasyOCR on real plates but has a hard
+# opencv version conflict with ultralytics on Py3.12 and a complex install on
+# Windows. The detector code auto-prefers PaddleOCR when both are present and
+# falls back to EasyOCR otherwise — no code change needed.
+#
+# To install (separately, after the base install above succeeds):
+#   pip install -r requirements-paddle.txt

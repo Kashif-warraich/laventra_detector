@@ -26,3 +26,8 @@ env/
 .claude/
 .DS_Store
 *.swp
+
+# License — never commit signing keys or one-off test licenses
+dev_license_private_key.pem
+dev_license.jwt
+# Keep license_public_key.pem tracked — detectors need it to verify backend tokens.

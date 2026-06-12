@@ -1,0 +1,22 @@
+# Optional PaddleOCR upgrade — see requirements.txt for context.
+#
+# Important: paddleocr 2.7.3 pins opencv-python<=4.6.0.66 which conflicts with
+# the ultralytics opencv pin in the base install. The workaround is either:
+#
+#   (a) install PaddleOCR in a *separate* virtualenv that has neither
+#       ultralytics nor opencv-python==4.8.x installed (only for offline OCR
+#       experimentation, not the live detector), OR
+#
+#   (b) use --no-deps to bypass paddleocr's opencv pin (it works fine against
+#       opencv 4.8.x in practice — the pin is just outdated metadata):
+#
+#         pip install paddlepaddle==2.6.2
+#         pip install paddleocr==2.7.3 --no-deps
+#         pip install shapely pyclipper imgaug lmdb pdf2docx \
+#                     rapidfuzz scikit-image lanms-neo Polygon3 \
+#                     premailer openpyxl attrdict beautifulsoup4 tqdm
+#
+# After installation, the detector picks PaddleOCR automatically on next run.
+
+paddlepaddle==2.6.2
+# paddleocr==2.7.3   ← install with --no-deps; see above
