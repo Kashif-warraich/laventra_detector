@@ -226,6 +226,7 @@ def _scan_subnet_for_camera(reference_url: str) -> str | None:
 class CameraStream:
     def __init__(self, url: str):
         self._url = url
+        self._max_age_default = self._max_age_for(url)
         self._cap = None
         self._frame = None
         self._frame_ts: float = 0.0       # monotonic timestamp of last frame
@@ -236,6 +237,16 @@ class CameraStream:
         self._fail_count = 0
         self._last_rediscovery = 0.0
         self._rediscovery_lock = threading.Lock()
+
+    @staticmethod
+    def _max_age_for(url: str) -> float:
+        """Pick a staleness ceiling appropriate to the stream kind."""
+        u = str(url).lower()
+        if u.startswith("rtsp://"):
+            return config.CAMERA_FRAME_MAX_AGE_RTSP_S
+        if u.startswith("http"):
+            return config.CAMERA_FRAME_MAX_AGE_MJPEG_S
+        return config.CAMERA_FRAME_MAX_AGE_S
 
     @property
     def url(self) -> str:
@@ -265,7 +276,7 @@ class CameraStream:
         treated as stale and None is returned — caller will loop again.
         """
         if max_age_s is None:
-            max_age_s = config.CAMERA_FRAME_MAX_AGE_S
+            max_age_s = self._max_age_default
         with self._lock:
             if self._frame is None:
                 return None

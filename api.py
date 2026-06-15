@@ -8,6 +8,7 @@ and we surface a `LicenseRevoked` upstream — the operator must re-activate.
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 
@@ -36,6 +37,21 @@ class PermanentFailure(Exception):
 
 class TransientFailure(Exception):
     """Backend unreachable / 5xx — caller should queue and retry later."""
+
+
+class LicenseRejected(TransientFailure):
+    """
+    Backend rejected the credential (401/403) — the license is inactive,
+    expired, or revoked.
+
+    This is a *transient* failure, NOT permanent: the event is re-queued (never
+    dead-lettered) so a temporary license lapse (billing hiccup, admin toggling
+    a license, a brief expiry before renewal) loses zero washed-car events. A
+    genuinely permanent revocation is handled separately — detection pauses (the
+    LicenseChecker flips to invalid) and, if the queue keeps failing, events
+    eventually age out to dead_letter via QUEUE_MAX_RETRIES, where they're
+    visible instead of silently dropped.
+    """
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -84,11 +100,13 @@ def post_event(payload: dict) -> bool:
 
     if r.status_code in (200, 201):
         return True
-    if r.status_code == 401:
-        raise PermanentFailure(
-            "License rejected by backend",
-            status=401, body=r.text[:400],
-        )
+    # 401/403 = credential/license problem → TRANSIENT (re-queue + pause), never
+    # dead_letter. The license may be temporarily inactive/expired; dropping the
+    # event permanently here would lose a real washed car.
+    if r.status_code in (401, 403):
+        raise LicenseRejected(f"License rejected by backend (HTTP {r.status_code})")
+    # Other 4xx (notably 422 validation) = the payload itself is unacceptable;
+    # retrying will not help → permanent → dead_letter for operator inspection.
     if 400 <= r.status_code < 500:
         raise PermanentFailure(
             f"Backend rejected event: HTTP {r.status_code}",
@@ -151,7 +169,9 @@ class HeartbeatThread:
             queue_depth=db.queue_count(),
         )
         while not self._stop.is_set():
-            self._stop.wait(config.HEARTBEAT_INTERVAL_S)
+            # Jitter so a fleet of detectors doesn't heartbeat in lockstep.
+            self._stop.wait(config.HEARTBEAT_INTERVAL_S
+                            + random.uniform(0, config.PULSE_JITTER_S))
             if self._stop.is_set():
                 break
             try:
@@ -168,14 +188,27 @@ class HeartbeatThread:
 class QueueFlusher:
     """
     Periodically retries events from the local sqlite queue.
-    Routes PermanentFailure → dead_letter, TransientFailure → bumps retry_count.
+
+    Routing:
+      success            → delete row (sent)
+      PermanentFailure   → dead_letter (422 validation; un-retryable payload)
+      LicenseRejected    → stop the batch (paused); row stays for next cycle
+      TransientFailure   → bump retry_count; on the final allowed attempt the
+                           row is moved to dead_letter instead of being stranded.
+
+    `license_ok_fn` (optional) lets the flusher skip entirely while the license
+    is known-invalid, so it doesn't burn retry_count against a backend that is
+    deliberately rejecting us during a pause.
     """
 
-    def __init__(self):
+    def __init__(self, *, license_ok_fn=None):
         self._stop = threading.Event()
         self._thread = None
+        self._license_ok_fn = license_ok_fn
 
     def start(self) -> None:
+        # Clean up any rows that already exhausted their retries in a prior run.
+        db.sweep_exhausted()
         n = db.queue_count()
         if n:
             log.info(f"📥 {n} offline event(s) pending retry")
@@ -190,13 +223,20 @@ class QueueFlusher:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            self._stop.wait(config.QUEUE_FLUSH_INTERVAL_S)
+            # Jitter so a fleet of detectors doesn't flush in lockstep.
+            self._stop.wait(config.QUEUE_FLUSH_INTERVAL_S
+                            + random.uniform(0, config.PULSE_JITTER_S))
             if self._stop.is_set():
                 break
             self._flush()
 
     def _flush(self) -> None:
-        # Skip if license is locally invalid — queued events would be rejected
+        # Skip while the license is known-invalid (avoid burning retries during
+        # a pause). Checked via the live LicenseChecker flag when provided…
+        if self._license_ok_fn is not None and not self._license_ok_fn():
+            log.debug("Queue flush skipped — license paused")
+            return
+        # …and as a fallback, against the locally-stored JWT's own validity.
         lic = db.license_get() or {}
         token = lic.get("license_jwt")
         if not token:
@@ -204,14 +244,14 @@ class QueueFlusher:
         try:
             license_module.verify_jwt(token)
         except license_module.LicenseInvalid:
-            log.debug("Queue flush skipped — license invalid")
+            log.debug("Queue flush skipped — local JWT invalid")
             return
 
         rows = db.pending()
         if not rows:
             return
         log.info(f"🔄 Retrying {len(rows)} queued event(s)…")
-        sent = dropped = failed = 0
+        sent = dead = failed = 0
         for row in rows:
             payload = {
                 "plate":           row["plate"],
@@ -226,18 +266,30 @@ class QueueFlusher:
                 post_event(payload)
                 db.mark_sent(row["id"])
                 sent += 1
+            except LicenseRejected:
+                # License flipped to invalid mid-flush — stop hammering, keep the
+                # row, let the next cycle (or a reactivation) handle it.
+                log.debug("Queue flush paused — license rejected mid-batch")
+                break
             except PermanentFailure as pf:
                 db.dead_letter_add(payload=payload,
                                    error_code=pf.status, error_body=pf.body)
                 db.mark_sent(row["id"])
-                dropped += 1
+                dead += 1
             except TransientFailure:
-                db.mark_failed(row["id"])
-                failed += 1
-        if sent or dropped:
+                # On the last allowed attempt, dead_letter rather than strand it.
+                if (row["retry_count"] or 0) + 1 >= config.QUEUE_MAX_RETRIES:
+                    db.dead_letter_add(payload=payload, error_code=0,
+                                       error_body=f"retries exhausted (>= {config.QUEUE_MAX_RETRIES})")
+                    db.mark_sent(row["id"])
+                    dead += 1
+                else:
+                    db.mark_failed(row["id"])
+                    failed += 1
+        if sent or dead:
             msg = f"✅ Flushed {sent}/{len(rows)}"
-            if dropped:
-                msg += f"  dead-lettered {dropped}"
+            if dead:
+                msg += f"  dead-lettered {dead}"
             log.info(msg)
         elif failed:
             log.warning(f"Flush: 0/{len(rows)} sent — backend still unreachable")

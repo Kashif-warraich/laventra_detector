@@ -397,6 +397,7 @@ class LicenseChecker:
     def __init__(self):
         import threading
         self._stop  = threading.Event()
+        self._wake  = threading.Event()   # cut the sleep short for an early re-check
         self._lock  = threading.Lock()
         self._valid = True   # boot check already passed — start as valid
         self._thread = None
@@ -420,18 +421,30 @@ class LicenseChecker:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()   # break the interruptible sleep so shutdown is prompt
         if self._thread:
             self._thread.join(timeout=3)
+
+    def trigger_recheck(self) -> None:
+        """
+        Pause detection immediately and wake the checker to re-verify now.
+
+        Called when a live API call returns 401/403 (LicenseRejected). Fail-safe:
+        we flip to invalid first (pausing detection) and let the re-check confirm
+        — so a real revocation is honoured within seconds instead of waiting up
+        to LICENSE_RETRY_INTERVAL_S, and a fluke simply resumes on the next check.
+        """
+        self._set_valid(False)
+        self._wake.set()
 
     def _loop(self) -> None:
         interval = config.LICENSE_CHECK_INTERVAL_S
         in_retry  = False
 
+        # Check-then-sleep: verify immediately on start. Previously the loop slept
+        # a full interval first, so up to LICENSE_CHECK_INTERVAL_S (24h) could pass
+        # before the first runtime check and a mid-run revocation went unnoticed.
         while not self._stop.is_set():
-            self._stop.wait(interval)
-            if self._stop.is_set():
-                break
-
             try:
                 valid = self._check()
             except Exception as e:
@@ -454,6 +467,12 @@ class LicenseChecker:
                     )
                     in_retry = True
                 interval = config.LICENSE_RETRY_INTERVAL_S
+
+            # Interruptible sleep: trigger_recheck() or stop() cuts it short.
+            self._wake.clear()
+            self._wake.wait(interval)
+            if self._stop.is_set():
+                break
 
     def _check(self) -> bool:
         """Return True if license is confirmed valid, False otherwise."""

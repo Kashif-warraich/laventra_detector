@@ -22,6 +22,11 @@ QUEUE_FLUSH_INTERVAL_S = 60
 QUEUE_MAX_RETRIES = 10
 QUEUE_BATCH_LIMIT = 20
 
+# Jitter added to periodic loops (heartbeat, flusher, license checker) so a
+# fleet of detectors doesn't hammer the backend in a synchronised burst.
+# Each wait becomes interval + random(0, PULSE_JITTER_S). See scaling notes.
+PULSE_JITTER_S = 10
+
 # ── License ──────────────────────────────────────────────────────────────────
 LICENSE_CHECK_INTERVAL_S = 24 * 60 * 60            # normal check cadence (24h)
 LICENSE_RETRY_INTERVAL_S = 5 * 60                  # retry cadence when license is invalid (5min)
@@ -32,16 +37,24 @@ JWT_ALGORITHM = "RS256"
 
 # ── Camera ───────────────────────────────────────────────────────────────────
 # When the camera drops, optionally scan the local /24 to find it at a new IP.
-# Disable on customer networks where an active port scan would trip an IDS, or
-# where the camera IP is pinned via a DHCP reservation.
-CAMERA_AUTO_REDISCOVERY = True
+# SECURITY: OFF by default. An active subnet port-scan can trip a customer IDS,
+# and "attach to the first host that answers" can silently bind to the WRONG
+# camera (a neighbour's IP cam, another site on the same LAN). Pin the camera IP
+# via a DHCP reservation instead. Enable only on isolated, single-tenant networks.
+CAMERA_AUTO_REDISCOVERY = False
 CAMERA_RECONNECT_DELAY_S = 10
 CAMERA_RECONNECT_MAX_DELAY_S = 60                   # cap exponential backoff
 CAMERA_FAILURE_THRESHOLD = 30                       # consecutive read fails → drop+reopen
 CAMERA_REDISCOVERY_COOLDOWN_S = 600                 # rate-limit subnet scans (10m)
 CAMERA_MJPEG_BUF_MAX = 2_000_000                    # cap MJPEG byte buffer (2MB)
-CAMERA_FRAME_MAX_AGE_S = 0.5                        # drop frames older than this in main loop
 CAMERA_SCAN_PORT_TIMEOUT_S = 0.3
+
+# Frame-staleness ceiling: a frame older than this is treated as "no frame".
+# Source-aware so a slow phone/MJPEG feed isn't starved into under-detection
+# while RTSP (real-time) still drops stale frames aggressively.
+CAMERA_FRAME_MAX_AGE_S = 2.0                         # default / unknown source
+CAMERA_FRAME_MAX_AGE_RTSP_S = 0.5                    # RTSP is real-time
+CAMERA_FRAME_MAX_AGE_MJPEG_S = 2.0                   # MJPEG/webcam can be slower
 
 # ── Detection / OCR ──────────────────────────────────────────────────────────
 # Stage 1 — vehicle tracker. Generic COCO model; we only use the bbox + track_id.

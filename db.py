@@ -14,6 +14,8 @@ Tables
 """
 import sqlite3
 import logging
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import config
@@ -21,19 +23,61 @@ import config
 log = logging.getLogger("laventra")
 DB_PATH = config.DB_PATH
 
+# One shared connection, serialised by a reentrant lock. See _conn() for why.
+_LOCK = threading.RLock()
+_SHARED_CON: sqlite3.Connection | None = None
+_SHARED_PATH = None
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
-def _conn() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
-    # Three writer threads (heartbeat, flusher, dispatcher) share this DB. Wait
-    # up to 5s for a lock instead of raising "database is locked" immediately.
-    con.execute("PRAGMA busy_timeout=5000")
-    return con
+def _raw_connection() -> sqlite3.Connection:
+    # Reconnect if DB_PATH changed since we last opened (no-op in production,
+    # where it never changes; matters for tests that point at a temp file and
+    # for --deactivate flows that recreate the DB).
+    global _SHARED_CON, _SHARED_PATH
+    if _SHARED_CON is None or _SHARED_PATH != DB_PATH:
+        if _SHARED_CON is not None:
+            try:
+                _SHARED_CON.close()
+            except Exception:
+                pass
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=WAL")
+        # Wait up to 5s for a lock instead of raising "database is locked".
+        con.execute("PRAGMA busy_timeout=5000")
+        _SHARED_CON = con
+        _SHARED_PATH = DB_PATH
+    return _SHARED_CON
+
+
+@contextmanager
+def _conn():
+    """
+    Serialised access to a single shared SQLite connection.
+
+    The detector has up to four writer threads (dispatcher, flusher, heartbeat,
+    camera-rediscovery). The old code opened a *new* connection per call and the
+    `with sqlite3.connect(...)` context manager committed but never *closed* it —
+    a slow connection/fd leak over a multi-day run, plus needless lock contention
+    that could surface as "database is locked" and silently drop a write.
+
+    Now every operation funnels through one connection under a reentrant lock:
+    writers serialise (SQLite allows only one writer anyway), nothing leaks, and
+    the per-call connect + PRAGMA overhead is gone. Call sites keep using
+    `with _conn() as con:` unchanged; commit/rollback is handled here.
+    """
+    with _LOCK:
+        con = _raw_connection()
+        try:
+            yield con
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
 
 
 def init() -> None:
@@ -301,7 +345,14 @@ def enqueue(*, plate: str, vehicle_type: str, started_at: str, ended_at: str,
                  confidence, camera_id, client_event_id, now),
             )
     except Exception as e:
-        log.error(f"enqueue error ({plate}): {e}")
+        # Last-resort durability: if even the offline queue write fails, dump the
+        # full payload to the log at ERROR so the event is recoverable by hand
+        # rather than silently lost.
+        log.error(
+            f"enqueue FAILED ({e}) — event not persisted: "
+            f"plate={plate} started={started_at} ended={ended_at} "
+            f"client_event_id={client_event_id}"
+        )
 
 
 def pending(max_retries: int = config.QUEUE_MAX_RETRIES,
@@ -363,6 +414,56 @@ def queue_count(max_retries: int = config.QUEUE_MAX_RETRIES) -> int:
     except Exception as e:
         log.error(f"queue_count error: {e}")
         return 0
+
+
+def sweep_exhausted(max_retries: int = config.QUEUE_MAX_RETRIES) -> int:
+    """
+    Move queue rows that have exhausted their retries into dead_letter, then
+    delete them from the queue.
+
+    Previously a row that hit retry_count >= max was simply excluded from
+    pending()/queue_count() and stranded forever — neither sent, nor
+    dead-lettered, nor counted, nor visible to --show-deadletter. This closes
+    that silent-loss + table-leak hole. Called on flusher startup and after
+    each flush so exhausted events become visible (and alertable) instead of
+    rotting in the queue table.
+    """
+    import json
+    moved = 0
+    try:
+        with _conn() as con:
+            rows = con.execute(
+                "SELECT * FROM queue WHERE retry_count >= ?", (max_retries,)
+            ).fetchall()
+            for r in rows:
+                payload = {
+                    "plate":           r["plate"],
+                    "vehicle_type":    r["vehicle_type"],
+                    "started_at":      r["started_at"],
+                    "ended_at":        r["ended_at"],
+                    "confidence":      r["confidence"],
+                    "camera_id":       r["camera_id"],
+                    "client_event_id": r["client_event_id"],
+                }
+                con.execute(
+                    """
+                    INSERT INTO dead_letter
+                      (plate, vehicle_type, started_at, ended_at, confidence,
+                       camera_id, error_code, error_body, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (r["plate"], r["vehicle_type"], r["started_at"], r["ended_at"],
+                     r["confidence"], r["camera_id"], 0,
+                     f"retries exhausted (>= {max_retries})",
+                     json.dumps(payload, default=str), _utc_now()),
+                )
+                con.execute("DELETE FROM queue WHERE id = ?", (r["id"],))
+                moved += 1
+    except Exception as e:
+        log.error(f"sweep_exhausted error: {e}")
+    if moved:
+        log.warning(f"⚠️  {moved} event(s) exhausted retries → dead_letter")
+    return moved
 
 
 # ── dead_letter (permanent failures) ────────────────────────────────────────

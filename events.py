@@ -26,10 +26,14 @@ log = logging.getLogger("laventra")
 
 
 class EventDispatcher:
-    def __init__(self, *, queue_size: int = 100):
+    def __init__(self, *, queue_size: int = 100, on_license_rejected=None):
         self._q: _queue.Queue = _queue.Queue(maxsize=queue_size)
         self._stop = threading.Event()
         self._thread = None
+        # Optional hook fired when the backend rejects our license (401/403), so
+        # the main loop can pause detection promptly instead of waiting for the
+        # LicenseChecker's next scheduled poll.
+        self._on_license_rejected = on_license_rejected
         self.stats = {"sent": 0, "queued": 0, "dead_letter": 0, "dropped_overflow": 0}
 
     def start(self) -> None:
@@ -101,6 +105,18 @@ class EventDispatcher:
             api.post_event(payload)
             self.stats["sent"] += 1
             log.info(f"✅ Event posted → {plate}")
+        except api.LicenseRejected:
+            # License lapse — re-queue (never dead_letter) and ask the main loop
+            # to pause detection now. LicenseRejected subclasses TransientFailure,
+            # so this branch MUST come before the TransientFailure handler.
+            self.stats["queued"] += 1
+            db.enqueue(**_to_queue_kwargs(payload))
+            log.warning(f"📥 Event queued (license paused) → {plate}")
+            if self._on_license_rejected:
+                try:
+                    self._on_license_rejected()
+                except Exception as e:
+                    log.debug(f"on_license_rejected hook error: {e}")
         except api.PermanentFailure as pf:
             self.stats["dead_letter"] += 1
             db.dead_letter_add(payload=payload, error_code=pf.status, error_body=pf.body)

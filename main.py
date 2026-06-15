@@ -387,10 +387,17 @@ def _run_detector() -> int:
     cam_stream = camera_module.CameraStream(cam_url)
     cam_stream.start()
 
-    dispatcher = events_module.EventDispatcher()
+    # Create the checker first so the dispatcher/flusher can reference it: a
+    # license rejection on a live POST pauses detection immediately (via the
+    # dispatcher hook), and the flusher skips retries while paused.
+    checker = license_module.LicenseChecker()
+
+    dispatcher = events_module.EventDispatcher(
+        on_license_rejected=checker.trigger_recheck,
+    )
     dispatcher.start()
 
-    flusher = api.QueueFlusher()
+    flusher = api.QueueFlusher(license_ok_fn=lambda: checker.is_valid)
     flusher.start()
 
     heartbeat = api.HeartbeatThread(
@@ -399,7 +406,6 @@ def _run_detector() -> int:
     )
     heartbeat.start()
 
-    checker = license_module.LicenseChecker()
     checker.start()
 
     log.info("✅ Detector running — Ctrl+C to stop")
