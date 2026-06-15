@@ -20,6 +20,7 @@ env/
 *.mp4
 *.mov
 *.MOV
+models/
 
 # IDE / OS
 .idea/
