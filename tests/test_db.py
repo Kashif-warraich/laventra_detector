@@ -144,6 +144,19 @@ def test_cameras_replace_is_idempotent():
     assert cams[0]["name"] == "A renamed"
 
 
+def test_cameras_update_url_persists_for_next_boot():
+    db.cameras_replace([{"id": 1, "name": "Entry", "stream_url": "rtsp://old/1"}])
+    db.cameras_update_url(1, "rtsp://new/1")
+    # startup reads the active camera from this table, so the new URL must stick
+    assert db.cameras_get(1)["stream_url"] == "rtsp://new/1"
+
+
+def test_cameras_update_url_unknown_id_is_noop():
+    db.cameras_replace([{"id": 1, "name": "Entry", "stream_url": "rtsp://old/1"}])
+    db.cameras_update_url(999, "rtsp://nope")
+    assert db.cameras_get(1)["stream_url"] == "rtsp://old/1"
+
+
 # ─── migration ──────────────────────────────────────────────────────────────
 def test_legacy_session_migration_drops_password(tmp_path, monkeypatch):
     """Create a legacy DB with `session` table including password; migration

@@ -316,6 +316,24 @@ def cameras_list() -> list:
         return []
 
 
+def cameras_update_url(camera_id: int, stream_url: str) -> None:
+    """
+    Update one camera's stream_url in the local cache.
+
+    Startup reads the active camera from this table (cameras.selected()), so a
+    runtime URL change must land here to survive a restart — updating only the
+    kv `camera_url` would be forgotten on next boot.
+    """
+    try:
+        with _conn() as con:
+            con.execute(
+                "UPDATE cameras SET stream_url = ?, updated_at = ? WHERE id = ?",
+                (stream_url, _utc_now(), int(camera_id)),
+            )
+    except Exception as e:
+        log.error(f"cameras_update_url error: {e}")
+
+
 def cameras_get(camera_id: int) -> dict | None:
     try:
         with _conn() as con:

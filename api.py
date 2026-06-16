@@ -105,6 +105,11 @@ def post_event(payload: dict) -> bool:
     # event permanently here would lose a real washed car.
     if r.status_code in (401, 403):
         raise LicenseRejected(f"License rejected by backend (HTTP {r.status_code})")
+    # 408 Request Timeout / 429 Too Many Requests are throttling/transient, not a
+    # bad payload — retrying later WILL help, so queue (never dead_letter) so a
+    # rate-limited burst doesn't permanently drop real washed-car events.
+    if r.status_code in (408, 429):
+        raise TransientFailure(f"Backend throttled (HTTP {r.status_code}) — will retry")
     # Other 4xx (notably 422 validation) = the payload itself is unacceptable;
     # retrying will not help → permanent → dead_letter for operator inspection.
     if 400 <= r.status_code < 500:
@@ -117,7 +122,12 @@ def post_event(payload: dict) -> bool:
 
 # ─── Heartbeat ──────────────────────────────────────────────────────────────
 def send_heartbeat(*, camera_id=None, camera_online: bool = None,
-                   queue_depth: int = None) -> bool:
+                   queue_depth: int = None) -> dict | None:
+    """
+    POST a heartbeat. Returns the camera config the backend echoes back
+    ({"id", "stream_url", "kind"}) so the caller can sync a portal-side
+    stream_url change, or None on failure / when no camera config is returned.
+    """
     body = _strip_none({
         "version":       config.VERSION,
         "camera_id":     camera_id,
@@ -133,12 +143,20 @@ def send_heartbeat(*, camera_id=None, camera_online: bool = None,
         )
     except requests.exceptions.RequestException as e:
         log.debug(f"heartbeat: {e}")
-        return False
+        return None
 
-    if r.status_code == 200:
-        return True
-    log.warning(f"heartbeat: HTTP {r.status_code}")
-    return False
+    if r.status_code != 200:
+        log.warning(f"heartbeat: HTTP {r.status_code}")
+        return None
+
+    try:
+        data = r.json() or {}
+        payload = data.get("data", data) if isinstance(data.get("data"), dict) else data
+        cam = payload.get("camera")
+        return cam if isinstance(cam, dict) else None
+    except Exception as e:
+        log.debug(f"heartbeat: could not parse response ({e})")
+        return None
 
 
 class HeartbeatThread:
@@ -146,9 +164,13 @@ class HeartbeatThread:
     Periodic heartbeat. Sends device status to the backend on a regular cadence.
     """
 
-    def __init__(self, *, camera_status_fn=None, camera_id=None):
+    def __init__(self, *, camera_status_fn=None, camera_id=None,
+                 on_camera_url=None):
         self._cam_status = camera_status_fn or (lambda: True)
         self._camera_id = camera_id
+        # Called with the backend's current stream_url when it differs from what
+        # we're streaming — lets a portal-side IP change propagate on the pulse.
+        self._on_camera_url = on_camera_url
         self._stop = threading.Event()
         self._thread = None
 
@@ -162,12 +184,29 @@ class HeartbeatThread:
         if self._thread:
             self._thread.join(timeout=3)
 
+    def _sync_camera(self, camera: dict | None) -> None:
+        """Apply a backend-echoed stream_url for the camera we're bound to."""
+        if not camera or not self._on_camera_url:
+            return
+        try:
+            url = camera.get("stream_url")
+            if not url:
+                return
+            cid = camera.get("id")
+            # Only act on the camera this detector is streaming from.
+            if (self._camera_id is not None and cid is not None
+                    and int(cid) != int(self._camera_id)):
+                return
+            self._on_camera_url(url)
+        except Exception as e:
+            log.debug(f"heartbeat camera sync skipped: {e}")
+
     def _loop(self) -> None:
-        send_heartbeat(
+        self._sync_camera(send_heartbeat(
             camera_id=self._camera_id,
             camera_online=bool(self._cam_status()),
             queue_depth=db.queue_count(),
-        )
+        ))
         while not self._stop.is_set():
             # Jitter so a fleet of detectors doesn't heartbeat in lockstep.
             self._stop.wait(config.HEARTBEAT_INTERVAL_S
@@ -175,11 +214,11 @@ class HeartbeatThread:
             if self._stop.is_set():
                 break
             try:
-                send_heartbeat(
+                self._sync_camera(send_heartbeat(
                     camera_id=self._camera_id,
                     camera_online=bool(self._cam_status()),
                     queue_depth=db.queue_count(),
-                )
+                ))
             except Exception as e:
                 log.warning(f"heartbeat loop error: {e}")
 

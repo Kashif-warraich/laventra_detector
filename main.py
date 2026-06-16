@@ -400,9 +400,16 @@ def _run_detector() -> int:
     flusher = api.QueueFlusher(license_ok_fn=lambda: checker.is_valid)
     flusher.start()
 
+    # Sync a portal-side stream_url change on the heartbeat pulse: swap the live
+    # stream AND persist to the cameras table so the new URL survives a restart.
+    def _apply_camera_url(new_url: str) -> None:
+        cam_stream.set_url(new_url)
+        db.cameras_update_url(cam_id, new_url)
+
     heartbeat = api.HeartbeatThread(
         camera_status_fn=lambda: cam_stream.connected,
         camera_id=cam_id,
+        on_camera_url=_apply_camera_url,
     )
     heartbeat.start()
 

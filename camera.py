@@ -285,6 +285,24 @@ class CameraStream:
                 return None
             return self._frame.copy()
 
+    def set_url(self, new_url: str) -> None:
+        """
+        Swap the stream source at runtime and force a reconnect.
+
+        Safe to call from any thread: we just repoint `self._url`, refresh the
+        staleness ceiling for the new scheme, persist the URL, and release the
+        current capture. The read loop notices `_cap is None` on its next pass
+        and reopens against the new URL. No-op if the URL is blank/unchanged.
+        """
+        new_url = str(new_url).strip()
+        if not new_url or new_url == self._url:
+            return
+        log.info(f"📷 Camera URL changed → {new_url}  (was {self._url})")
+        self._url = new_url
+        self._max_age_default = self._max_age_for(new_url)
+        db.kv_set("camera_url", new_url)
+        self._release()  # loop reopens with the new URL
+
     # ── internals ────────────────────────────────────────────────────────
     def _open(self) -> bool:
         self._release()
@@ -332,9 +350,7 @@ class CameraStream:
                 discovered = _scan_subnet_for_camera(self._url)
                 if discovered and discovered != self._url:
                     log.info(f"📡 Camera found at new address: {discovered}")
-                    self._url = discovered
-                    db.kv_set("camera_url", discovered)
-                    self._release()  # main loop will reopen
+                    self.set_url(discovered)  # repoint + persist + reopen
             except Exception as e:
                 log.debug(f"Rediscovery error: {e}")
             finally:
