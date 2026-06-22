@@ -1,0 +1,65 @@
+<!--
+  WinSW service definition for the Laventra detector.
+
+  Setup (one-time, per machine):
+    1. Download WinSW (the .NET 4.x "WinSW-x64.exe") from
+       https://github.com/winsw/winsw/releases
+    2. Put it in THIS folder and rename it to: LaventraDetector.exe
+       (so LaventraDetector.exe sits next to LaventraDetector.xml)
+    3. Open an ELEVATED (Administrator) terminal in this folder and run:
+         .\LaventraDetector.exe install
+         .\LaventraDetector.exe start
+    4. It now shows up in services.msc and Task Manager -> Services as
+       "Laventra Detector". Manage it there, or with sc / net:
+         sc query LaventraDetector
+         net stop LaventraDetector
+         net start LaventraDetector
+
+  Uninstall:
+         .\LaventraDetector.exe stop
+         .\LaventraDetector.exe uninstall
+
+  %BASE% expands to this folder (the detector's  service\  dir), so the
+  paths below point one level up at the detector root.
+-->
+<service>
+  <id>LaventraDetector</id>
+  <name>Laventra Detector</name>
+  <description>Laventra edge detector: vehicle + license-plate detection, posts car-wash events to the backend.</description>
+
+  <!-- Run the project's venv Python on main.py, from the detector root. -->
+  <workingdirectory>%BASE%\..</workingdirectory>
+  <executable>%BASE%\..\venv\Scripts\python.exe</executable>
+  <arguments>-u main.py</arguments>
+
+  <!-- Start automatically, but a bit after boot so it isn't fighting for I/O. -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Graceful stop: WinSW sends Ctrl+C, which main.py's _on_signal catches to
+       flush in-flight visits before exiting. Hard-kill only after the timeout. -->
+  <stoptimeout>20 sec</stoptimeout>
+
+  <!-- Auto-restart on crash / non-zero exit (e.g. boot-time license-invalid
+       exit), with backoff so a revoked license doesn't hot-loop. Counter
+       resets after an hour of healthy uptime. -->
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="restart" delay="60 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- WinSW's own stdout/stderr capture, rolled by size (the detector still
+       writes its own laventra.log in the root via log_setup). -->
+  <logpath>%BASE%\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+
+  <!-- If first-run model downloads fail behind Avast TLS, uncomment so the
+       service run trusts the exported Windows CA bundle:
+  <env name="SSL_CERT_FILE"      value="%BASE%\..\win-ca-bundle.pem"/>
+  <env name="REQUESTS_CA_BUNDLE" value="%BASE%\..\win-ca-bundle.pem"/>
+  <env name="CURL_CA_BUNDLE"     value="%BASE%\..\win-ca-bundle.pem"/>
+  -->
+</service>
