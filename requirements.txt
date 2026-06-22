@@ -19,6 +19,19 @@ easyocr==1.7.1
 # Lazy plate-model download from Hugging Face
 huggingface_hub==0.24.7
 
+# Plate model loader. The keremberke YOLOv5 .pt is loaded via the `yolov5`
+# package (detector.py::_YoloV5PlateModel) to bypass ultralytics' pkg_resources
+# check that chokes on these weights. NOTE: installing this standalone pulls
+# numpy 2.x + newer opencv via its resolver — the numpy/opencv pins above hold
+# them back, so keep this BELOW those pins (the transitive sahi/roboflow opencv
+# warnings are harmless; the detector never imports them).
+yolov5==7.0.14
+
+# The yolov5 plate-weights pickle imports `pkg_resources` at load time, which
+# setuptools removed in 81.0.0. Pin below that or the plate model fails with
+# "No module named 'pkg_resources'".
+setuptools<81
+
 # ── Optional accuracy upgrade ────────────────────────────────────────────────
 # PaddleOCR is ~5–10% more accurate than EasyOCR on real plates but has a hard
 # opencv version conflict with ultralytics on Py3.12 and a complex install on
