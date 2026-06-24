@@ -46,11 +46,6 @@ Then activate the device (see General → Activation) and run it:
 python main.py
 ```
 
-> **On Windows getting a TLS / certificate error during `pip install`?**
-> It's almost always an antivirus (e.g. Avast) inspecting HTTPS traffic.
-> Disable its HTTPS/web shield and retry — or point pip at the bundled CA file:
-> `pip install -r requirements.txt --cert win-ca-bundle.pem`
-
 ---
 
 ## Common Commands
