@@ -8,11 +8,11 @@ BACKEND CONTRACT  —  these endpoints must exist on the Rails API.
 1) POST  /api/v1/license/activate
    Body  (JSON):
        {
-         "activation_code":     "XXXX-YYYY-ZZZZ-AAAA",
+         "license_code":        "LAVN-XXXXXX-XXXXXX-XXXXXX",
          "device_fingerprint":  "<sha256 hex of stable hw identifiers>",
          "hostname":            "<reported hostname>"
        }
-   Auth: NONE (the activation code IS the credential)
+   Auth: NONE (the license code IS the credential)
    Response 200:
        {
          "license_jwt":    "<RS256 JWT>",
@@ -103,7 +103,7 @@ class LicenseRevoked(LicenseError):
 
 
 class ActivationError(LicenseError):
-    """Failed to exchange activation code for a license."""
+    """Failed to activate the device with its license code."""
 
 
 # ─── Device fingerprint ─────────────────────────────────────────────────────
@@ -194,15 +194,15 @@ def verify_jwt(token: str, *, check_fingerprint: bool = True) -> dict:
 
 
 # ─── Activation ─────────────────────────────────────────────────────────────
-def activate(*, api_url: str, activation_code: str) -> dict:
+def activate(*, api_url: str, license_code: str) -> dict:
     """
-    Exchange an activation code for a signed license JWT.
+    Exchange the license code for a signed license JWT.
     Stores license + api_url. Returns the verified claims.
     """
     url = _v1(api_url) + "/license/activate"
     fp = device_fingerprint()
     body = {
-        "activation_code": activation_code.strip(),
+        "license_code": license_code.strip(),
         "device_fingerprint": fp,
         "hostname": hostname(),
     }
@@ -232,6 +232,12 @@ def activate(*, api_url: str, activation_code: str) -> dict:
     claims = verify_jwt(token)
 
     db.kv_set("api_url", api_url.rstrip("/"))
+    # Persist the License code so the detector can silently re-activate when its
+    # JWT has fully expired and a plain refresh is no longer possible (see
+    # attempt_reactivate). Keeps "reconfigure only when the license expires" true
+    # without an on-site visit after an admin renews. It is the same per-lavvaggio
+    # license credential and lives alongside the JWT, which is already local.
+    db.kv_set("license_code", license_code.strip())
     db.license_save(
         token,
         license_id=claims.get("license_id", ""),
@@ -246,6 +252,30 @@ def activate(*, api_url: str, activation_code: str) -> dict:
         f"expires={_ts_to_iso(claims.get('exp'))}"
     )
     return claims
+
+
+# ─── Self-heal via re-activation ────────────────────────────────────────────
+def attempt_reactivate() -> bool:
+    """
+    Silently re-activate using the stored License code + api_url.
+
+    Recovers the one case a plain refresh cannot: once the local JWT has fully
+    expired, /license/refresh rejects us (our own bearer credential is expired),
+    so a server-side renewal would otherwise need an on-site --activate. The
+    backend accepts re-activation from the SAME device fingerprint, so this is
+    safe to run unattended. Returns True on success.
+    """
+    code    = db.kv_get("license_code", "")
+    api_url = db.kv_get("api_url", "")
+    if not code or not api_url:
+        return False
+    try:
+        activate(api_url=api_url, license_code=code)
+        log.info("♻️  License self-healed via re-activation")
+        return True
+    except LicenseError as e:
+        log.debug(f"Self-heal re-activation failed: {e}")
+        return False
 
 
 # ─── Boot-time revocation check ────────────────────────────────────────────
@@ -482,7 +512,14 @@ class LicenseChecker:
             return True
 
         if status == "invalid":
-            log.warning("License check: backend says inactive or revoked")
+            # Backend rejected our token. If our local JWT has also expired, a
+            # refresh can't recover us — try a one-shot silent re-activation
+            # (same fingerprint) in case the admin renewed the license. If it is
+            # genuinely revoked/inactive this just fails and we stay invalid,
+            # retrying on the normal 5-min cadence.
+            log.warning("License check: backend says inactive or revoked — attempting self-heal")
+            if attempt_reactivate():
+                return True
             return False
 
         # Backend offline — fall back to local JWT expiry

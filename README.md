@@ -1,24 +1,24 @@
 # Laventra Detector — Setup Guide
 
-Edge-device service that watches the car wash entrance, detects vehicles, and
-reads license plates. It posts events to the Laventra API.
+Edge service that detects vehicles, reads license plates, and sends events to the Laventra API.
 
-Requires **Python 3.11**. There's no login — the license JWT issued by the admin
-is the only credential.
+**Requirements**
+
+* Python 3.11
 
 ---
 
 ## General
 
-### 1. License key
+### 1. Public key
 
-The detector verifies tokens signed by the backend using `license_public_key.pem`
-(already in this repo). Only replace it if the backend rotated its keys — grab the
-new one from the API's `config/license_keys/public_key.pem`.
+The detector verifies licenses using `license_public_key.pem`, which is included in this repository.
 
-### 2. Activation
+If the backend rotates its keys, replace this file with the latest `config/license_keys/public_key.pem` from the API.
 
-Activate once per machine, using a code the admin issues from the web console:
+### 2. Activate the detector
+
+Activate the detector once using the license code provided by an administrator.
 
 ```bash
 python main.py --activate LAVN-XXXX-XXXX-XXXX --api-url http://localhost:3000
@@ -29,41 +29,30 @@ python main.py --activate LAVN-XXXX-XXXX-XXXX --api-url http://localhost:3000
 ## Setup (macOS, Linux & Windows)
 
 ```bash
-# Create and activate a virtual environment
+# Create a virtual environment
 python3.11 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+
+# Activate it
+# macOS / Linux
+source venv/bin/activate
+
+# Windows
+venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Download the vehicle detection model (the plate model downloads on first run)
-python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
-```
-
-Then activate the device (see General → Activation) and run it:
-
-```bash
+# Start the detector
 python main.py
 ```
 
----
 
-## Common Commands
+## Useful Commands
 
 ```bash
-python main.py --status                    # license, camera, and queue status
-python main.py --select-camera             # pick which camera to use
-python main.py --test --source video.mp4   # test on a video file, no API posting
-python main.py --debug                     # verbose logging
-python main.py --deactivate                # wipe the license before moving machines
+python main.py --status
+python main.py --select-camera
+python main.py --test --source video.mp4
+python main.py --debug
+python main.py --deactivate
 ```
-
----
-
-## Troubleshooting
-
-* **`Signature verification failed`** — the public key doesn't match the backend.
-  Copy the API's `config/license_keys/public_key.pem` here as `license_public_key.pem`.
-* **`already bound to a different device`** — the license was activated on another
-  machine. Ask an admin to clear the device fingerprint, then run `--activate` again.
-</content>

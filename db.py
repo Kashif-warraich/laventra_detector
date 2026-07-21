@@ -513,6 +513,46 @@ def dead_letter_add(*, payload: dict, error_code: int, error_body: str) -> None:
         log.error(f"dead_letter_add error: {e}")
 
 
+def dead_letter_requeue() -> int:
+    """
+    Move every dead-lettered event back into the retry queue (resetting
+    retry_count) and clear those rows. Returns the count moved. Preserves
+    client_event_id (parsed from payload_json) so a re-sent event still dedupes
+    on the backend. Used by `--requeue-deadletter` after a backend-side fix.
+    """
+    import json
+    try:
+        with _conn() as con:
+            rows = con.execute("SELECT * FROM dead_letter").fetchall()
+            moved = 0
+            for r in rows:
+                # queue requires started_at/ended_at/plate NOT NULL; skip malformed.
+                if not r["started_at"] or not r["ended_at"] or not r["plate"]:
+                    log.warning(f"Skipping un-requeueable dead_letter row id={r['id']}")
+                    continue
+                client_event_id = None
+                try:
+                    client_event_id = (json.loads(r["payload_json"]) or {}).get("client_event_id")
+                except Exception:
+                    pass
+                con.execute(
+                    """
+                    INSERT INTO queue (plate, vehicle_type, started_at, ended_at,
+                                       confidence, camera_id, client_event_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (r["plate"], r["vehicle_type"] or "unknown",
+                     r["started_at"], r["ended_at"], r["confidence"],
+                     r["camera_id"], client_event_id, _utc_now()),
+                )
+                con.execute("DELETE FROM dead_letter WHERE id = ?", (r["id"],))
+                moved += 1
+        return moved
+    except Exception as e:
+        log.error(f"dead_letter_requeue error: {e}")
+        return 0
+
+
 def dead_letter_count() -> int:
     try:
         with _conn() as con:

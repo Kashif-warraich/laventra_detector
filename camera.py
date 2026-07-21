@@ -31,6 +31,26 @@ import db
 log = logging.getLogger("laventra")
 
 
+def mask_url(url) -> str:
+    """
+    Redact embedded credentials in a URL for safe logging/display.
+    'rtsp://user:pass@host:554/s' → 'rtsp://***:***@host:554/s'.
+    Non-URL / index sources are returned unchanged.
+    """
+    try:
+        s = str(url)
+        p = urlparse(s)
+        if p.password is None and p.username is None:
+            return s
+        host = p.hostname or ""
+        if p.port:
+            host = f"{host}:{p.port}"
+        netloc = f"***:***@{host}" if p.password is not None else f"***@{host}"
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+    except Exception:
+        return str(url)
+
+
 # ─── MJPEG-over-HTTP reader ────────────────────────────────────────────────
 class _MJPEGCapture:
     """
@@ -62,7 +82,7 @@ class _MJPEGCapture:
             self._buf = b""
             self._opened = True
         except requests.exceptions.RequestException as e:
-            log.warning(f"MJPEG connect failed ({self._url}): {e}")
+            log.warning(f"MJPEG connect failed ({mask_url(self._url)}): {e}")
             self._opened = False
 
     def isOpened(self) -> bool:
@@ -178,8 +198,14 @@ def _local_subnet_hosts():
     return [str(h) for h in net.hosts() if str(h) != local_ip]
 
 
-def _scan_subnet_for_camera(reference_url: str) -> str | None:
-    """Return a new URL (or None) where the camera now lives on this LAN."""
+def _scan_subnet_for_camera(reference_url: str, expected_shape=None) -> str | None:
+    """
+    Return a new URL (or None) where the camera now lives on this LAN.
+
+    A candidate must not only serve a decodable frame but also match
+    `expected_shape` (H, W) of the last-known good frame, so a random MJPEG
+    server on the LAN can't impersonate the camera just by decoding something.
+    """
     port = _extract_port(reference_url)
     if not port:
         return None
@@ -212,8 +238,14 @@ def _scan_subnet_for_camera(reference_url: str) -> str | None:
             cap = _open_capture(url)
             try:
                 if cap.isOpened():
-                    ret, _ = cap.read()
-                    if ret:
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        if expected_shape is not None and frame.shape[:2] != expected_shape:
+                            log.warning(
+                                f"📡 Ignoring {ip}:{port} — frame {frame.shape[:2]} "
+                                f"does not match known camera {expected_shape}"
+                            )
+                            continue
                         return url
             finally:
                 cap.release()
@@ -237,6 +269,7 @@ class CameraStream:
         self._fail_count = 0
         self._last_rediscovery = 0.0
         self._rediscovery_lock = threading.Lock()
+        self._last_good_shape = None      # (H, W) of last decoded frame — identity hint
 
     @staticmethod
     def _max_age_for(url: str) -> float:
@@ -257,7 +290,7 @@ class CameraStream:
         return self._connected
 
     def start(self) -> bool:
-        log.info(f"📷 Opening camera: {self._url}")
+        log.info(f"📷 Opening camera: {mask_url(self._url)}")
         self._open()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="camera")
         self._thread.start()
@@ -297,7 +330,7 @@ class CameraStream:
         new_url = str(new_url).strip()
         if not new_url or new_url == self._url:
             return
-        log.info(f"📷 Camera URL changed → {new_url}  (was {self._url})")
+        log.info(f"📷 Camera URL changed → {mask_url(new_url)}  (was {mask_url(self._url)})")
         self._url = new_url
         self._max_age_default = self._max_age_for(new_url)
         db.kv_set("camera_url", new_url)
@@ -315,12 +348,12 @@ class CameraStream:
                     self._cap = cap
                     self._connected = True
                     self._fail_count = 0
-                    log.info(f"✅ Camera connected: {self._url}")
+                    log.info(f"✅ Camera connected: {mask_url(self._url)}")
                     return True
                 cap.release()
                 log.warning("Camera opened but no frames received")
             else:
-                log.warning(f"Cannot open: {self._url}")
+                log.warning(f"Cannot open: {mask_url(self._url)}")
         except Exception as e:
             log.error(f"Camera open error: {e}")
         return False
@@ -347,9 +380,11 @@ class CameraStream:
 
         def _run():
             try:
-                discovered = _scan_subnet_for_camera(self._url)
+                discovered = _scan_subnet_for_camera(
+                    self._url, expected_shape=self._last_good_shape
+                )
                 if discovered and discovered != self._url:
-                    log.info(f"📡 Camera found at new address: {discovered}")
+                    log.info(f"📡 Camera found at new address: {mask_url(discovered)}")
                     self.set_url(discovered)  # repoint + persist + reopen
             except Exception as e:
                 log.debug(f"Rediscovery error: {e}")
@@ -391,6 +426,7 @@ class CameraStream:
                 with self._lock:
                     self._frame = frame
                     self._frame_ts = ts
+                self._last_good_shape = frame.shape[:2]
                 self._connected = True
                 self._fail_count = 0
             else:
