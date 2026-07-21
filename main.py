@@ -3,9 +3,9 @@ Laventra detector — edge-device entry point.
 
 Common operations
 ─────────────────
-  python main.py --activate XXXX-YYYY-ZZZZ           Activate this device.
-                                                       (One-time. Admin issues the
-                                                        code from the web UI.)
+  python main.py --activate LAVN-XXXXXX-XXXXXX-XXXXXX Activate this device with its
+                                                       license code (admin creates the
+                                                        License in the web UI).
   python main.py --select-camera                      Pick which camera to stream.
   python main.py --status                             Show config + license + queue.
   python main.py                                      Run the detector.
@@ -13,6 +13,7 @@ Common operations
   python main.py --test --source FILE                Test mode on a video file.
   python main.py --deactivate                        Clear license + queue.
   python main.py --show-deadletter                   Print permanently-rejected events.
+  python main.py --requeue-deadletter                 Move dead-lettered events back to the retry queue.
   python main.py --clear-queue                        Drop the offline retry queue.
 
 There is no password, no login, no relogin. The license JWT (issued by the
@@ -63,10 +64,13 @@ def _detect_gpu() -> bool:
 # ─── CLI ───────────────────────────────────────────────────────────────────
 def _args():
     p = argparse.ArgumentParser(prog="laventra-detector")
-    p.add_argument("--activate", metavar="CODE",
-                   help="Exchange an activation code for a license and exit")
+    p.add_argument("--activate", metavar="LICENSE_CODE",
+                   help="Activate this device with its license code and exit")
     p.add_argument("--api-url", metavar="URL",
                    help="Backend API URL (used with --activate; saved for later)")
+    p.add_argument("--insecure", action="store_true",
+                   help="Allow a plain http:// backend URL (default: HTTPS required, "
+                        "since the license JWT is sent as a bearer token)")
     p.add_argument("--select-camera", action="store_true",
                    help="Pick which camera to stream and exit")
     p.add_argument("--deactivate", action="store_true",
@@ -80,6 +84,8 @@ def _args():
                         "(default: selected camera)")
     p.add_argument("--clear-queue", action="store_true")
     p.add_argument("--show-deadletter", action="store_true")
+    p.add_argument("--requeue-deadletter", action="store_true",
+                   help="Move dead-lettered events back into the retry queue and exit")
     p.add_argument("--add-camera", metavar="URL",
                    help="Register a camera locally without backend round-trip "
                         "(useful for offline testing). Use with --camera-name and "
@@ -104,10 +110,21 @@ def _cmd_activate(args) -> int:
         log.error("No --api-url and none stored — cannot activate")
         return 1
 
+    # The license JWT travels as a bearer token on every subsequent request; a
+    # plain-http backend would expose it on the wire. Require HTTPS unless the
+    # operator explicitly opts out (e.g. an on-prem backend behind a VPN).
+    if not api_url.lower().startswith("https://") and not args.insecure:
+        if api_url.lower().startswith("http://"):
+            log.error("Refusing http:// backend — the license token would be sent in cleartext.")
+            log.error("  Use an https:// URL, or pass --insecure if you accept the risk.")
+            return 1
+        log.warning("API URL has no scheme — assuming https://")
+        api_url = "https://" + api_url
+
     log.info(f"Activating against {api_url}…")
     try:
         claims = license_module.activate(api_url=api_url,
-                                         activation_code=args.activate)
+                                         license_code=args.activate)
     except license_module.ActivationError as e:
         log.error(f"❌ Activation failed: {e}")
         return 1
@@ -198,6 +215,7 @@ def _cmd_deactivate() -> int:
     n = db.queue_clear()
     db.kv_delete("camera_id")
     db.kv_delete("camera_url")
+    db.kv_delete("license_code")
     log.info(f"✅ Cleared license, cameras, and {n} queued event(s)")
     return 0
 
@@ -217,7 +235,7 @@ def _cmd_status() -> int:
     print(f"  Lavvaggio       : {s['lavvaggio_id']}")
     cam = cameras_module.selected()
     if cam:
-        print(f"  Camera          : #{cam['id']} {cam['name']} → {cam['stream_url']}")
+        print(f"  Camera          : #{cam['id']} {cam['name']} → {camera_module.mask_url(cam['stream_url'])}")
     else:
         print(f"  Camera          : — (run --select-camera)")
     print(f"  Offline queue   : {s['queue']} pending")
@@ -368,7 +386,7 @@ def _run_detector() -> int:
     print("═" * 52)
     print(f"  Device     : #{claims.get('sub')}  ({license_module.hostname()})")
     print(f"  Lavvaggio  : #{claims.get('lavvaggio_id')}")
-    print(f"  Camera     : #{cam_id} {cam['name']} → {cam_url}")
+    print(f"  Camera     : #{cam_id} {cam['name']} → {camera_module.mask_url(cam_url)}")
     print(f"  API        : {db.kv_get('api_url')}")
     print(f"  Queue      : {db.queue_count()} pending")
     print("═" * 52)
@@ -544,6 +562,10 @@ def main() -> int:
         return 0
     if args.show_deadletter:
         return _cmd_show_deadletter()
+    if args.requeue_deadletter:
+        n = db.dead_letter_requeue()
+        print(f"✅ Moved {n} dead-lettered event(s) back to the retry queue")
+        return 0
     if args.add_camera:
         return _cmd_add_camera(args)
     if args.activate:
